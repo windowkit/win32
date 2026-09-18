@@ -105,3 +105,4 @@ void InitSurfaceExports(Napi::Env env, Napi::Object exports);
 void InitTextExports(Napi::Env env, Napi::Object exports);
 void InitDesktopExports(Napi::Env env, Napi::Object exports);
 void InitBezelExports(Napi::Env env, Napi::Object exports);
+void InitGlExports(Napi::Env env, Napi::Object exports);

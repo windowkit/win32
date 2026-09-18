@@ -892,6 +892,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitTextExports(env, exports);
   InitDesktopExports(env, exports);
   InitBezelExports(env, exports);
+  InitGlExports(env, exports);
   return exports;
 }
 
