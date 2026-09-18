@@ -108,6 +108,10 @@ struct Event {
   std::string type;
   int id = 0;
   double a = 0, b = 0, c = 0, d = 0;
+  // Anything that is not a number: a file dialog's chosen paths, the action a
+  // tray menu item carries. UTF-16, because that is what Win32 hands over and
+  // what N-API takes, with no conversion in between.
+  std::u16string text;
 };
 
 void Emit(const Event& event) {
@@ -120,6 +124,7 @@ void Emit(const Event& event) {
     out.Set("b", Napi::Number::New(env, event.b));
     out.Set("c", Napi::Number::New(env, event.c));
     out.Set("d", Napi::Number::New(env, event.d));
+    if (!event.text.empty()) out.Set("text", Napi::String::New(env, event.text));
     callback.Call({out});
   });
 }
@@ -693,6 +698,17 @@ Napi::Value PostMouseEvent(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(info.Env(), true);
 }
 
+// The window's HWND as a number. The shell integrations take one — a taskbar
+// button and a dialog's owner are both identified by it — and this is the one
+// place a raw handle crosses into JS, which is why it is a plain number and
+// not pretended to be anything else.
+Napi::Value WindowHandle(const Napi::CallbackInfo& info) {
+  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
+  return Napi::Number::New(
+      info.Env(),
+      window ? static_cast<double>(reinterpret_cast<intptr_t>(window->hwnd)) : 0);
+}
+
 Napi::Value SetTitle(const Napi::CallbackInfo& info) {
   Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
   if (!window) return info.Env().Undefined();
@@ -887,15 +903,37 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("moveWindow", Napi::Function::New(env, MoveWindow));
   exports.Set("destroyWindow", Napi::Function::New(env, DestroyWindow_));
   exports.Set("listScreens", Napi::Function::New(env, ListScreens));
+  exports.Set("windowHandle", Napi::Function::New(env, WindowHandle));
   exports.Set("postMouseEvent", Napi::Function::New(env, PostMouseEvent));
   InitSurfaceExports(env, exports);
   InitTextExports(env, exports);
   InitDesktopExports(env, exports);
   InitBezelExports(env, exports);
   InitGlExports(env, exports);
+  InitShellExports(env, exports);
   return exports;
 }
 
 }  // namespace
+
+// The seam the other translation units reach the thread split through. Defined
+// here because the queue and the event channel are this file's; declared in
+// bridge.h so shell.cc and its siblings need nothing else.
+void PostToUiThread(std::function<void()> command) {
+  PostCommand(std::move(command));
+}
+
+void EmitEvent(const char* type, int id, double a, double b, double c, double d,
+               const std::u16string& text) {
+  Event event;
+  event.type = type;
+  event.id = id;
+  event.a = a;
+  event.b = b;
+  event.c = c;
+  event.d = d;
+  event.text = text;
+  Emit(event);
+}
 
 NODE_API_MODULE(win32, Init)

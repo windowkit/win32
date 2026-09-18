@@ -18,6 +18,7 @@
 #include <dcomp.h>
 #include <dwmapi.h>
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -101,8 +102,18 @@ ID2D1SolidColorBrush* MakeBrush(Surface* surface, const D2D1_COLOR_F& color);
 
 ID2D1StrokeStyle1* MakeStrokeStyle(Surface* surface);
 
+// The two halves of the thread split, for the translation units that are not
+// win32.cc. `PostToUiThread` runs a command where the HWNDs and the modal
+// loops live — which is where the shell's are, since a file dialog and a tray
+// menu each run a loop of their own. `EmitEvent` is the only way back to JS.
+// Neither blocks.
+void PostToUiThread(std::function<void()> command);
+void EmitEvent(const char* type, int id, double a = 0, double b = 0, double c = 0,
+               double d = 0, const std::u16string& text = std::u16string());
+
 void InitSurfaceExports(Napi::Env env, Napi::Object exports);
 void InitTextExports(Napi::Env env, Napi::Object exports);
 void InitDesktopExports(Napi::Env env, Napi::Object exports);
 void InitBezelExports(Napi::Env env, Napi::Object exports);
 void InitGlExports(Napi::Env env, Napi::Object exports);
+void InitShellExports(Napi::Env env, Napi::Object exports);
