@@ -19,8 +19,9 @@
   "scripts": {
     "install": "node scripts/install.js",
     "build": "node-gyp rebuild",
-    "prebuild": "node scripts/prebuild.js",
-    "test": "node test/smoke.js"
+    "build:prebuild": "node scripts/prebuild.js",
+    "test": "node test/smoke.js",
+    "demo": "node examples/window.js"
   },
   "dependencies": {
     "node-addon-api": "^8.3.0"
