@@ -68,6 +68,8 @@ struct Window {
   Surface* drawing = nullptr;
   UINT width = 0;
   UINT height = 0;
+  // whether TrackMouseEvent is armed for this window (WM_MOUSELEAVE)
+  bool tracking = false;
 };
 
 std::mutex g_mutex;
@@ -147,10 +149,43 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       Emit(Event{"resize", window->id, static_cast<double>(LOWORD(lparam)),
                  static_cast<double>(HIWORD(lparam))});
       return 0;
-    case WM_MOUSEMOVE:
+    case WM_MOUSEMOVE: {
+      // Windows sends no "the pointer left" message unless it is asked, once,
+      // per entry. Without it a control keeps its :hover after the pointer has
+      // gone somewhere else entirely, which is the X11 LeaveNotify this stands
+      // in for.
+      if (!window->tracking) {
+        TRACKMOUSEEVENT track = {sizeof(track), TME_LEAVE, hwnd, 0};
+        ::TrackMouseEvent(&track);
+        window->tracking = true;
+      }
       Emit(Event{"mousemove", window->id, static_cast<double>(GET_X_LPARAM(lparam)),
                  static_cast<double>(GET_Y_LPARAM(lparam))});
       return 0;
+    }
+    case WM_MOUSELEAVE:
+      window->tracking = false;
+      Emit(Event{"mouseout", window->id});
+      return 0;
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL: {
+      // The wheel reports in screen coordinates where every other mouse
+      // message reports in client ones.
+      POINT at = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+      ::ScreenToClient(hwnd, &at);
+      // WHEEL_DELTA is a notch. A precision touchpad sends fractions of one by
+      // default and there is no opting out from an addon, which is exactly the
+      // `smooth` scrolling the wheel pipeline already takes.
+      const double notches =
+          static_cast<double>(GET_WHEEL_DELTA_WPARAM(wparam)) / WHEEL_DELTA;
+      const bool horizontal = message == WM_MOUSEHWHEEL;
+      Emit(Event{"wheel", window->id, static_cast<double>(at.x),
+                 static_cast<double>(at.y), horizontal ? notches : 0,
+                 // Down is positive for the renderer, and positive wparam is
+                 // a wheel rolled away from the user.
+                 horizontal ? 0 : -notches});
+      return 0;
+    }
     case WM_LBUTTONDOWN:
       Emit(Event{"mousedown", window->id, static_cast<double>(GET_X_LPARAM(lparam)),
                  static_cast<double>(GET_Y_LPARAM(lparam))});
@@ -557,6 +592,36 @@ Napi::Value Commit(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// postMouseEvent(id, 'move' | 'down' | 'up', x, y) — synthetic input posted
+// into the window procedure, which is docs/windows.md §Testing's hook. It goes
+// through the real WNDPROC, so everything downstream of the message is
+// exercised; what it does not exercise is the input stack above it, which is
+// robotjs's job and a different test.
+Napi::Value PostMouseEvent(const Napi::CallbackInfo& info) {
+  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
+  if (!window || !window->hwnd) return Napi::Boolean::New(info.Env(), false);
+
+  const std::string kind = info[1].As<Napi::String>().Utf8Value();
+  const int x = info[2].As<Napi::Number>().Int32Value();
+  const int y = info[3].As<Napi::Number>().Int32Value();
+  const LPARAM where = MAKELPARAM(x, y);
+
+  UINT message = WM_MOUSEMOVE;
+  WPARAM buttons = 0;
+  if (kind == "down") {
+    message = WM_LBUTTONDOWN;
+    buttons = MK_LBUTTON;
+  } else if (kind == "up") {
+    message = WM_LBUTTONUP;
+  }
+
+  HWND hwnd = window->hwnd;
+  PostCommand([hwnd, message, buttons, where]() {
+    ::PostMessageW(hwnd, message, buttons, where);
+  });
+  return Napi::Boolean::New(info.Env(), true);
+}
+
 Napi::Value SetTitle(const Napi::CallbackInfo& info) {
   Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
   if (!window) return info.Env().Undefined();
@@ -693,10 +758,17 @@ Napi::Value Show(const Napi::CallbackInfo& info) {
 // content is the last frame rather than garbage.
 Napi::Value Resize(const Napi::CallbackInfo& info) {
   Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
-  if (!window || !window->surface) return info.Env().Undefined();
+  if (!window) return info.Env().Undefined();
+  // The size is recorded even with no surface yet to resize. A window is
+  // created asynchronously, so an auto-sized one is measured and resized
+  // before its HWND exists — and compose() below reads these fields. Skipping
+  // the record left the surface at the size the window was *asked* for while
+  // JS painted at the size it *became*, and every BeginDraw outside the
+  // surface's bounds fails, which is a window that stays blank with nothing
+  // logged.
   window->width = info[1].As<Napi::Number>().Uint32Value();
   window->height = info[2].As<Napi::Number>().Uint32Value();
-  window->surface->Resize(window->width, window->height);
+  if (window->surface) window->surface->Resize(window->width, window->height);
   return info.Env().Undefined();
 }
 
@@ -739,6 +811,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("moveWindow", Napi::Function::New(env, MoveWindow));
   exports.Set("destroyWindow", Napi::Function::New(env, DestroyWindow_));
   exports.Set("listScreens", Napi::Function::New(env, ListScreens));
+  exports.Set("postMouseEvent", Napi::Function::New(env, PostMouseEvent));
   InitSurfaceExports(env, exports);
   InitTextExports(env, exports);
   return exports;

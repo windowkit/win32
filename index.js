@@ -64,4 +64,19 @@ function load() {
   return createRequire(__filename)(binary);
 }
 
-module.exports = load();
+const addon = load();
+
+// Teardown has two doors, and this is the second one. An environment that ends
+// normally runs N-API's cleanup hooks; `process.exit()` skips them, and a
+// process that goes while the UI thread is still inside its message loop exits
+// abnormally — code 9, with nothing said. `stop()` is idempotent, so the two
+// doors do not fight over which of them closed it.
+process.on('exit', () => {
+  try {
+    addon.stop();
+  } catch {
+    // Exiting already; a bridge that cannot be stopped has nothing left to say.
+  }
+});
+
+module.exports = addon;
