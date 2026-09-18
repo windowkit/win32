@@ -72,6 +72,9 @@ struct Window {
   bool tracking = false;
   // an override-redirect window — a menu, a select's list, a tooltip
   bool popup = false;
+  // `<window transparent>`: the app draws its own shape and the rest shows
+  // through. Together with `popup` this decides the surface's alpha mode.
+  bool transparent = false;
 };
 
 std::mutex g_mutex;
@@ -168,6 +171,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
     case WM_MOUSELEAVE:
       window->tracking = false;
       Emit(Event{"mouseout", window->id});
+      return 0;
+    case WM_MOVE:
+      // The *client* area's upper-left in screen coordinates, which is what
+      // WM_MOVE carries for an overlapped window and what anchor.js needs: a
+      // popup is placed in screen coordinates, and a window that does not
+      // report where it is anchors every menu as though it were at the origin.
+      Emit(Event{"move", window->id, static_cast<double>(GET_X_LPARAM(lparam)),
+                 static_cast<double>(GET_Y_LPARAM(lparam))});
       return 0;
     case WM_MOUSEWHEEL:
     case WM_MOUSEHWHEEL: {
@@ -464,6 +475,8 @@ Napi::Value CreateWindowExport(const Napi::CallbackInfo& info) {
   // Alt+Tab entry, and it must not steal activation from the window it belongs
   // to, or opening a menu would make the app's own window look unfocused.
   const bool popup = given("popup") && options.Get("popup").ToBoolean().Value();
+  const bool transparent =
+      given("transparent") && options.Get("transparent").ToBoolean().Value();
 
   Window* window = new Window();
   {
@@ -472,6 +485,7 @@ Napi::Value CreateWindowExport(const Napi::CallbackInfo& info) {
     window->width = static_cast<UINT>(width);
     window->height = static_cast<UINT>(height);
     window->popup = popup;
+    window->transparent = transparent;
     g_windows[window->id] = window;
   }
 
@@ -508,7 +522,14 @@ Napi::Value CreateWindowExport(const Napi::CallbackInfo& info) {
       std::lock_guard<std::mutex> lock(g_mutex);
       window->hwnd = hwnd;
     }
-    Emit(Event{"window-ready", window->id});
+    // Where the client area landed. A window created at CW_USEDEFAULT is
+    // cascaded by Windows, so this is the first moment anyone can know — and
+    // until JS knows it, every popup anchors as though the window were at the
+    // screen's origin.
+    POINT origin = {0, 0};
+    ::ClientToScreen(hwnd, &origin);
+    Emit(Event{"window-ready", window->id, static_cast<double>(origin.x),
+               static_cast<double>(origin.y)});
   });
 
   return Napi::Number::New(env, window->id);
@@ -533,11 +554,21 @@ Napi::Value Compose(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
   g_dcomp->CreateVisual(&window->visual);
-  // Alpha ignored, which is also what lets Direct2D draw ClearType onto it: it
-  // falls back to grayscale on any premultiplied target.
-  g_dcomp->CreateVirtualSurface(window->width, window->height,
-                                DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_IGNORE,
-                                &window->surface);
+  // An ordinary window ignores alpha, which is what lets Direct2D draw
+  // ClearType onto it: it falls back to grayscale on any premultiplied target.
+  //
+  // A window whose own shape is not the whole rectangle cannot afford that. A
+  // <popup> is rounded and shadowed, and a `transparent` window is
+  // transparent by definition — on an alpha-ignored surface the pixels outside
+  // the shape are whatever the buffer held, which composites as a dark fringe
+  // along every corner. So those take premultiplied alpha and the grayscale
+  // antialiasing that comes with it, which is the trade docs/windows.md
+  // §Text names.
+  const bool shaped = window->popup || window->transparent;
+  g_dcomp->CreateVirtualSurface(
+      window->width, window->height, DXGI_FORMAT_B8G8R8A8_UNORM,
+      shaped ? DXGI_ALPHA_MODE_PREMULTIPLIED : DXGI_ALPHA_MODE_IGNORE,
+      &window->surface);
   window->visual->SetContent(window->surface);
   window->target->SetRoot(window->visual);
   g_dcomp->Commit();
@@ -788,7 +819,12 @@ Napi::Value Show(const Napi::CallbackInfo& info) {
   const bool show = info.Length() < 2 || info[1].As<Napi::Boolean>().Value();
   if (window) {
     HWND hwnd = window->hwnd;
-    PostCommand([hwnd, show]() { ::ShowWindow(hwnd, show ? SW_SHOW : SW_HIDE); });
+    // A popup is shown without taking activation. WS_EX_NOACTIVATE keeps a
+    // *click* from activating it; SW_SHOW would still activate it here, and an
+    // app whose window visibly loses focus the moment a menu opens looks
+    // broken in a way no handler can fix.
+    const int how = show ? (window->popup ? SW_SHOWNOACTIVATE : SW_SHOW) : SW_HIDE;
+    PostCommand([hwnd, how]() { ::ShowWindow(hwnd, how); });
   }
   return info.Env().Undefined();
 }
