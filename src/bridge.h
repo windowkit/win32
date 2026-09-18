@@ -16,6 +16,7 @@
 #include <d2d1helper.h>
 #include <dwrite_3.h>
 #include <dcomp.h>
+#include <dwmapi.h>
 
 #include <map>
 #include <string>
@@ -102,3 +103,5 @@ ID2D1StrokeStyle1* MakeStrokeStyle(Surface* surface);
 
 void InitSurfaceExports(Napi::Env env, Napi::Object exports);
 void InitTextExports(Napi::Env env, Napi::Object exports);
+void InitDesktopExports(Napi::Env env, Napi::Object exports);
+void InitBezelExports(Napi::Env env, Napi::Object exports);

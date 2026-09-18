@@ -2,7 +2,7 @@
   "targets": [
     {
       "target_name": "win32",
-      "sources": ["src/win32.cc", "src/surface.cc", "src/text.cc"],
+      "sources": ["src/win32.cc", "src/surface.cc", "src/text.cc", "src/desktop.cc", "src/bezels.cc"],
       # `.include` and not `.include_dir`: the first is absolute and already
       # quoted, which is what the `<!@()` list form wants. `.include_dir` is
       # relative to the package, and node-gyp generates the project into
@@ -24,7 +24,12 @@
             "-ldwrite.lib",
             "-ldcomp.lib",
             "-ldxgi.lib",
-            "-lshcore.lib"
+            "-lshcore.lib",
+            "-ldwmapi.lib",
+            "-lgdi32.lib",
+            "-luser32.lib",
+            "-ladvapi32.lib",
+            "-luxtheme.lib"
           ],
           "msvs_settings": {
             "VCCLCompilerTool": {

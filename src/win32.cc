@@ -70,6 +70,8 @@ struct Window {
   UINT height = 0;
   // whether TrackMouseEvent is armed for this window (WM_MOUSELEAVE)
   bool tracking = false;
+  // an override-redirect window — a menu, a select's list, a tooltip
+  bool popup = false;
 };
 
 std::mutex g_mutex;
@@ -202,6 +204,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       // and let JS decide. This is the X11 contract's WM_DELETE_WINDOW.
       Emit(Event{"close", window->id});
       return 0;
+    case WM_SETTINGCHANGE:
+    case WM_THEMECHANGED:
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+      // Light or dark, the accent, high contrast and reduced motion all arrive
+      // as one of these three, broadcast to every top-level window. Which one
+      // it was does not matter: the appearance is re-read whole, because the
+      // ladder's rule is that one rung owns every field.
+      Emit(Event{"appearance", window->id});
+      // …and Windows still gets it. WM_SETTINGCHANGE in particular is acted on
+      // by the default procedure, and swallowing it leaves the frame out of
+      // step with the setting that just changed.
+      return ::DefWindowProcW(hwnd, message, wparam, lparam);
     case WM_DPICHANGED: {
       const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
       ::SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
@@ -425,20 +439,31 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
-// createWindow({ title, width, height }) -> id. The HWND does not exist yet;
-// a 'window-ready' event says when it does.
+// createWindow({ title, width, height, x, y, popup }) -> id. The HWND does not
+// exist yet; a 'window-ready' event says when it does.
 Napi::Value CreateWindowExport(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   Napi::Object options = info[0].As<Napi::Object>();
+  const auto given = [&](const char* name) {
+    return options.Has(name) && !options.Get(name).IsUndefined() &&
+           !options.Get(name).IsNull();
+  };
+  const auto number = [&](const char* name, int fallback) {
+    return given(name) ? options.Get(name).As<Napi::Number>().Int32Value() : fallback;
+  };
 
   std::u16string title = u"react-x11";
-  if (options.Has("title")) {
-    title = options.Get("title").As<Napi::String>().Utf16Value();
-  }
-  int width =
-      options.Has("width") ? options.Get("width").As<Napi::Number>().Int32Value() : 800;
-  int height =
-      options.Has("height") ? options.Get("height").As<Napi::Number>().Int32Value() : 600;
+  if (given("title")) title = options.Get("title").As<Napi::String>().Utf16Value();
+  const int width = number("width", 800);
+  const int height = number("height", 600);
+  const bool placed = given("x") && given("y");
+  const int x = number("x", CW_USEDEFAULT);
+  const int y = number("y", CW_USEDEFAULT);
+  // A `<popup>` — a menu, a select's list, a tooltip. It is an override-redirect
+  // window on X11 and the same idea here: no frame, no taskbar button, no
+  // Alt+Tab entry, and it must not steal activation from the window it belongs
+  // to, or opening a menu would make the app's own window look unfocused.
+  const bool popup = given("popup") && options.Get("popup").ToBoolean().Value();
 
   Window* window = new Window();
   {
@@ -446,19 +471,34 @@ Napi::Value CreateWindowExport(const Napi::CallbackInfo& info) {
     window->id = g_nextId++;
     window->width = static_cast<UINT>(width);
     window->height = static_cast<UINT>(height);
+    window->popup = popup;
     g_windows[window->id] = window;
   }
 
-  PostCommand([window, title, width, height]() {
+  PostCommand([window, title, width, height, x, y, placed, popup]() {
+    const DWORD style = popup ? WS_POPUP : WS_OVERLAPPEDWINDOW;
+    // No redirection bitmap: the window's pixels come from DirectComposition,
+    // and GDI never has a surface of its own to show.
+    DWORD exStyle = WS_EX_NOREDIRECTIONBITMAP;
+    if (popup) exStyle |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+
+    // The caller's width and height are the *client* area, as an X window's
+    // are. A framed window is grown to fit its frame around that; a WS_POPUP
+    // has no frame, so its client area is already the whole window and
+    // adjusting would make every menu a few pixels too big.
     RECT rect = {0, 0, width, height};
-    ::AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    if (!popup) ::AdjustWindowRectEx(&rect, style, FALSE, exStyle);
+
+    // A popup is placed by anchor.js against the monitor's work area, and that
+    // placement is the whole contract — a menu that opens at CW_USEDEFAULT is
+    // a menu in the wrong place.
+    const int left = placed ? x : CW_USEDEFAULT;
+    const int top = placed ? y : CW_USEDEFAULT;
+
     HWND hwnd = ::CreateWindowExW(
-        // No redirection bitmap: the window's pixels come from
-        // DirectComposition, and GDI never has a surface of its own to show.
-        WS_EX_NOREDIRECTIONBITMAP, kWindowClass,
-        reinterpret_cast<const wchar_t*>(title.c_str()), WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top,
-        nullptr, nullptr, ::GetModuleHandleW(nullptr), nullptr);
+        exStyle, kWindowClass, reinterpret_cast<const wchar_t*>(title.c_str()), style,
+        left, top, rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr,
+        ::GetModuleHandleW(nullptr), nullptr);
     if (!hwnd) {
       Emit(Event{"window-failed", window->id});
       return;
@@ -814,6 +854,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("postMouseEvent", Napi::Function::New(env, PostMouseEvent));
   InitSurfaceExports(env, exports);
   InitTextExports(env, exports);
+  InitDesktopExports(env, exports);
+  InitBezelExports(env, exports);
   return exports;
 }
 
