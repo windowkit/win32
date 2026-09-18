@@ -237,12 +237,60 @@ Napi::Value LayoutMetrics(const Napi::CallbackInfo& info) {
   UINT32 at = 0;
   float y = 0;
   for (UINT32 i = 0; i < actual; i++) {
+    const UINT32 start = at;
+    const UINT32 end = at + lines[i].length - lines[i].newlineLength;
+
     Napi::Object line = Napi::Object::New(env);
-    line.Set("start", Napi::Number::New(env, at));
-    line.Set("end", Napi::Number::New(env, at + lines[i].length - lines[i].newlineLength));
+    line.Set("start", Napi::Number::New(env, start));
+    line.Set("end", Napi::Number::New(env, end));
     line.Set("y", Napi::Number::New(env, y));
     line.Set("height", Napi::Number::New(env, lines[i].height));
     line.Set("baseline", Napi::Number::New(env, lines[i].baseline));
+
+    // The line's **runs**: one per direction and style change, which is what
+    // a selection highlight is built out of. A range is contiguous in logical
+    // order and a line is laid out in visual order, so a selection crossing
+    // into Arabic covers two disjoint stretches of pixels and a single rect
+    // from one caret to the other would paint over text nobody selected.
+    // HitTestTextRange answers exactly this, bidi level included.
+    Napi::Array out_runs = Napi::Array::New(env);
+    float lineX = 0;
+    float lineWidth = 0;
+    if (end > start) {
+      UINT32 count = 0;
+      entry->layout->HitTestTextRange(start, end - start, 0, 0, nullptr, 0, &count);
+      if (count > 0) {
+        std::vector<DWRITE_HIT_TEST_METRICS> hits(count);
+        if (SUCCEEDED(entry->layout->HitTestTextRange(start, end - start, 0, 0,
+                                                     hits.data(), count, &count))) {
+          float minLeft = 1e9f, maxRight = -1e9f;
+          for (UINT32 h = 0; h < count; h++) {
+            minLeft = (std::min)(minLeft, hits[h].left);
+            maxRight = (std::max)(maxRight, hits[h].left + hits[h].width);
+          }
+          lineX = minLeft;
+          lineWidth = maxRight - minLeft;
+          uint32_t slot = 0;
+          for (UINT32 h = 0; h < count; h++) {
+            Napi::Object run = Napi::Object::New(env);
+            run.Set("start", Napi::Number::New(env, hits[h].textPosition));
+            run.Set("end",
+                    Napi::Number::New(env, hits[h].textPosition + hits[h].length));
+            // Relative to the line's own left edge, which is what the band
+            // arithmetic above adds `line.x` back onto.
+            run.Set("x", Napi::Number::New(env, hits[h].left - minLeft));
+            run.Set("width", Napi::Number::New(env, hits[h].width));
+            // An odd bidi level is right-to-left; that is the definition.
+            run.Set("rtl", Napi::Boolean::New(env, (hits[h].bidiLevel & 1) != 0));
+            out_runs.Set(slot++, run);
+          }
+        }
+      }
+    }
+    line.Set("x", Napi::Number::New(env, lineX));
+    line.Set("width", Napi::Number::New(env, lineWidth));
+    line.Set("runs", out_runs);
+
     out_lines.Set(i, line);
     at += lines[i].length;
     y += lines[i].height;
