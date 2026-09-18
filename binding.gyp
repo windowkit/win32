@@ -23,7 +23,8 @@
             "-ld2d1.lib",
             "-ldwrite.lib",
             "-ldcomp.lib",
-            "-ldxgi.lib"
+            "-ldxgi.lib",
+            "-lshcore.lib"
           ],
           "msvs_settings": {
             "VCCLCompilerTool": {

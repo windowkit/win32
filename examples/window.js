@@ -52,7 +52,7 @@ function paintAll() {
     weight: 600,
   });
   win32.ctxSetFillColor(s, 0.95, 0.95, 0.97, 1);
-  win32.layoutDraw(s, layout, 24, 28);
+  win32.drawLayout(s, layout, 24, 28);
   win32.layoutRelease(layout);
 
   win32.endDraw(windowId);

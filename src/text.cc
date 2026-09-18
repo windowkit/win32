@@ -47,6 +47,18 @@ std::wstring Wide(const Napi::Value& value) {
   return std::wstring(reinterpret_cast<const wchar_t*>(s.c_str()), s.size());
 }
 
+// `Has` is true for a key that exists and holds undefined, which is what an
+// options object built from optional style properties is full of — `{ align:
+// undefined }` is the ordinary case, not a mistake. So every optional read
+// goes through here instead, or the first <text> without a textAlign throws
+// "A string was expected" from inside a yoga measure function, where nothing
+// in the stack names the property.
+bool Given(const Napi::Object& options, const char* key) {
+  if (!options.Has(key)) return false;
+  const Napi::Value value = options.Get(key);
+  return !value.IsUndefined() && !value.IsNull();
+}
+
 DWRITE_FONT_WEIGHT WeightOf(int weight) {
   return static_cast<DWRITE_FONT_WEIGHT>(std::clamp(weight, 1, 999));
 }
@@ -85,15 +97,15 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
   Napi::Object options = info[1].As<Napi::Object>();
 
   const std::wstring family =
-      ResolveFamily(options.Has("family") ? Wide(options.Get("family")) : L"");
-  const float size = options.Has("size")
+      ResolveFamily(Given(options, "family") ? Wide(options.Get("family")) : L"");
+  const float size = Given(options, "size")
                          ? static_cast<float>(options.Get("size").As<Napi::Number>().DoubleValue())
                          : 12.0f;
   const int weight =
-      options.Has("weight") ? options.Get("weight").As<Napi::Number>().Int32Value() : 400;
-  const bool italic = options.Has("italic") && options.Get("italic").ToBoolean().Value();
-  const bool rtl = options.Has("rtl") && options.Get("rtl").ToBoolean().Value();
-  float maxWidth = options.Has("maxWidth")
+      Given(options, "weight") ? options.Get("weight").As<Napi::Number>().Int32Value() : 400;
+  const bool italic = Given(options, "italic") && options.Get("italic").ToBoolean().Value();
+  const bool rtl = Given(options, "rtl") && options.Get("rtl").ToBoolean().Value();
+  float maxWidth = Given(options, "maxWidth")
                        ? static_cast<float>(options.Get("maxWidth").As<Napi::Number>().DoubleValue())
                        : 0.0f;
   // A width offer of zero is the min-content question, which DirectWrite
@@ -113,7 +125,7 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  if (options.Has("align")) {
+  if (Given(options, "align")) {
     const std::string align = options.Get("align").As<Napi::String>().Utf8Value();
     format->SetTextAlignment(align == "center"  ? DWRITE_TEXT_ALIGNMENT_CENTER
                              : align == "right" ? DWRITE_TEXT_ALIGNMENT_TRAILING
@@ -121,7 +133,7 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
   }
   format->SetReadingDirection(rtl ? DWRITE_READING_DIRECTION_RIGHT_TO_LEFT
                                   : DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
-  if (options.Has("lineHeight")) {
+  if (Given(options, "lineHeight")) {
     const float multiple =
         static_cast<float>(options.Get("lineHeight").As<Napi::Number>().DoubleValue());
     if (multiple > 0) {
@@ -131,7 +143,7 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
                              multiple * 0.8f);
     }
   }
-  if (options.Has("maxLines")) {
+  if (Given(options, "maxLines")) {
     const UINT32 maxLines = options.Get("maxLines").As<Napi::Number>().Uint32Value();
     if (maxLines == 1) format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
   }
@@ -158,27 +170,27 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
       DWRITE_TEXT_RANGE range = {span.Get("start").As<Napi::Number>().Uint32Value(),
                                  span.Get("length").As<Napi::Number>().Uint32Value()};
       if (range.length == 0) continue;
-      if (span.Has("family")) {
+      if (Given(span, "family")) {
         layout->SetFontFamilyName(ResolveFamily(Wide(span.Get("family"))).c_str(), range);
       }
-      if (span.Has("size")) {
+      if (Given(span, "size")) {
         layout->SetFontSize(
             static_cast<float>(span.Get("size").As<Napi::Number>().DoubleValue()), range);
       }
-      if (span.Has("weight")) {
+      if (Given(span, "weight")) {
         layout->SetFontWeight(WeightOf(span.Get("weight").As<Napi::Number>().Int32Value()),
                               range);
       }
-      if (span.Has("italic")) {
+      if (Given(span, "italic")) {
         layout->SetFontStyle(span.Get("italic").ToBoolean().Value()
                                  ? DWRITE_FONT_STYLE_ITALIC
                                  : DWRITE_FONT_STYLE_NORMAL,
                              range);
       }
-      if (span.Has("underline")) {
+      if (Given(span, "underline")) {
         layout->SetUnderline(span.Get("underline").ToBoolean().Value(), range);
       }
-      if (span.Has("r")) {
+      if (Given(span, "r")) {
         SpanColor color;
         color.start = range.startPosition;
         color.length = range.length;
@@ -268,21 +280,63 @@ Napi::Value LayoutDraw(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
-Napi::Value LayoutHitTestPoint(const Napi::CallbackInfo& info) {
+// The code-unit index under a point. fonts.js converts to code points, which
+// is the space the caret and the selection speak.
+Napi::Value LayoutIndexAt(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   TextLayout* entry = LayoutFor(info[0].As<Napi::Number>().Int32Value());
-  if (!entry) return env.Null();
+  if (!entry) return Napi::Number::New(env, 0);
 
   BOOL trailing = FALSE, inside = FALSE;
   DWRITE_HIT_TEST_METRICS metrics = {};
   entry->layout->HitTestPoint(static_cast<float>(info[1].As<Napi::Number>().DoubleValue()),
                               static_cast<float>(info[2].As<Napi::Number>().DoubleValue()),
                               &trailing, &inside, &metrics);
+  return Napi::Number::New(env, metrics.textPosition + (trailing ? 1 : 0));
+}
 
-  Napi::Object out = Napi::Object::New(env);
-  out.Set("index", Napi::Number::New(env, metrics.textPosition + (trailing ? 1 : 0)));
-  out.Set("inside", Napi::Boolean::New(env, inside == TRUE));
-  return out;
+// The same as drawLayout, with a linear gradient as the base ink — the path
+// BackendContext2D takes when a <text> is filled with a gradient.
+Napi::Value DrawLayoutGradient(const Napi::CallbackInfo& info) {
+  Surface* surface = SurfaceFor(info[0].As<Napi::Number>().Int32Value());
+  TextLayout* entry = LayoutFor(info[1].As<Napi::Number>().Int32Value());
+  if (!surface || !surface->dc || !entry) return info.Env().Undefined();
+
+  const float x = static_cast<float>(info[2].As<Napi::Number>().DoubleValue());
+  const float y = static_cast<float>(info[3].As<Napi::Number>().DoubleValue());
+
+  Napi::Array flat = info[8].As<Napi::Array>();
+  std::vector<D2D1_GRADIENT_STOP> stops;
+  for (uint32_t i = 0; i + 4 < flat.Length(); i += 5) {
+    D2D1_GRADIENT_STOP stop = {};
+    stop.position = static_cast<float>(flat.Get(i).As<Napi::Number>().DoubleValue());
+    stop.color = {static_cast<float>(flat.Get(i + 1).As<Napi::Number>().DoubleValue()),
+                  static_cast<float>(flat.Get(i + 2).As<Napi::Number>().DoubleValue()),
+                  static_cast<float>(flat.Get(i + 3).As<Napi::Number>().DoubleValue()),
+                  static_cast<float>(flat.Get(i + 4).As<Napi::Number>().DoubleValue())};
+    stops.push_back(stop);
+  }
+  if (stops.empty()) return info.Env().Undefined();
+
+  ID2D1GradientStopCollection* collection = nullptr;
+  surface->dc->CreateGradientStopCollection(stops.data(),
+                                            static_cast<UINT32>(stops.size()), &collection);
+  if (!collection) return info.Env().Undefined();
+  ID2D1LinearGradientBrush* brush = nullptr;
+  surface->dc->CreateLinearGradientBrush(
+      D2D1::LinearGradientBrushProperties(
+          {static_cast<float>(info[4].As<Napi::Number>().DoubleValue()),
+           static_cast<float>(info[5].As<Napi::Number>().DoubleValue())},
+          {static_cast<float>(info[6].As<Napi::Number>().DoubleValue()),
+           static_cast<float>(info[7].As<Napi::Number>().DoubleValue())}),
+      collection, &brush);
+  collection->Release();
+  if (!brush) return info.Env().Undefined();
+
+  surface->dc->DrawTextLayout(D2D1::Point2F(x, y), entry->layout, brush,
+                              D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+  brush->Release();
+  return info.Env().Undefined();
 }
 
 Napi::Value LayoutCaret(const Napi::CallbackInfo& info) {
@@ -417,10 +471,13 @@ void InitTextExports(Napi::Env env, Napi::Object exports) {
   };
   set("layoutCreate", LayoutCreate);
   set("layoutMetrics", LayoutMetrics);
-  set("layoutDraw", LayoutDraw);
-  set("layoutHitTestPoint", LayoutHitTestPoint);
-  set("layoutCaret", LayoutCaret);
   set("layoutRelease", LayoutRelease);
+  set("layoutIndexAt", LayoutIndexAt);
+  set("layoutCaret", LayoutCaret);
+  // These two names are BackendContext2D's, not ours: it calls them on the
+  // native it was handed, so the bridge answers them as @windowkit/appkit does.
+  set("drawLayout", LayoutDraw);
+  set("drawLayoutGradient", DrawLayoutGradient);
   set("fontMetrics", FontMetrics);
   set("fontExists", FontExists);
   set("listFonts", ListFonts);

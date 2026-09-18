@@ -23,6 +23,7 @@
 #include <windowsx.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <shellscalingapi.h>
 
 #include <functional>
 #include <mutex>
@@ -556,6 +557,127 @@ Napi::Value Commit(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+Napi::Value SetTitle(const Napi::CallbackInfo& info) {
+  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
+  if (!window) return info.Env().Undefined();
+  const std::u16string title = info[1].As<Napi::String>().Utf16Value();
+  HWND hwnd = window->hwnd;
+  PostCommand([hwnd, title]() {
+    if (hwnd) ::SetWindowTextW(hwnd, reinterpret_cast<const wchar_t*>(title.c_str()));
+  });
+  return info.Env().Undefined();
+}
+
+Napi::Value ResizeWindow(const Napi::CallbackInfo& info) {
+  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
+  if (!window) return info.Env().Undefined();
+  const int width = info[1].As<Napi::Number>().Int32Value();
+  const int height = info[2].As<Napi::Number>().Int32Value();
+  HWND hwnd = window->hwnd;
+  PostCommand([hwnd, width, height]() {
+    if (!hwnd) return;
+    // The caller means the client area, as an X window's width does; Windows
+    // sizes the whole frame.
+    RECT rect = {0, 0, width, height};
+    ::AdjustWindowRectEx(&rect, static_cast<DWORD>(::GetWindowLongPtrW(hwnd, GWL_STYLE)),
+                         FALSE, 0);
+    ::SetWindowPos(hwnd, nullptr, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
+                   SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+  });
+  return info.Env().Undefined();
+}
+
+Napi::Value MoveWindow(const Napi::CallbackInfo& info) {
+  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
+  if (!window) return info.Env().Undefined();
+  const int x = info[1].As<Napi::Number>().Int32Value();
+  const int y = info[2].As<Napi::Number>().Int32Value();
+  HWND hwnd = window->hwnd;
+  PostCommand([hwnd, x, y]() {
+    if (hwnd) {
+      ::SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+  });
+  return info.Env().Undefined();
+}
+
+Napi::Value DestroyWindow_(const Napi::CallbackInfo& info) {
+  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
+  if (!window) return info.Env().Undefined();
+  HWND hwnd = window->hwnd;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    window->hwnd = nullptr;
+  }
+  if (window->surface) window->surface->Release();
+  if (window->visual) window->visual->Release();
+  if (window->target) window->target->Release();
+  window->surface = nullptr;
+  window->visual = nullptr;
+  window->target = nullptr;
+  PostCommand([hwnd]() {
+    if (hwnd) ::DestroyWindow(hwnd);
+  });
+  return info.Env().Undefined();
+}
+
+// The monitors, in device pixels with their scales. Asked on this thread, not
+// the UI thread — but a DPI-unaware thread is answered in scaled-down virtual
+// pixels, so the awareness context is set for the length of the call. That is
+// the same reason docs/windows.md gives for the UI thread owning the real
+// query: the answer depends on who is asking.
+Napi::Value ListScreens(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Array out = Napi::Array::New(env);
+
+  DPI_AWARENESS_CONTEXT previous =
+      ::SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+  struct Collector {
+    Napi::Env env;
+    Napi::Array* out;
+    uint32_t at = 0;
+  } collector{env, &out};
+
+  ::EnumDisplayMonitors(
+      nullptr, nullptr,
+      [](HMONITOR monitor, HDC, LPRECT, LPARAM param) -> BOOL {
+        auto* c = reinterpret_cast<Collector*>(param);
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        if (!::GetMonitorInfoW(monitor, &mi)) return TRUE;
+
+        UINT dpiX = 96, dpiY = 96;
+        ::GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
+
+        Napi::Object screen = Napi::Object::New(c->env);
+        screen.Set("x", Napi::Number::New(c->env, mi.rcMonitor.left));
+        screen.Set("y", Napi::Number::New(c->env, mi.rcMonitor.top));
+        screen.Set("width",
+                   Napi::Number::New(c->env, mi.rcMonitor.right - mi.rcMonitor.left));
+        screen.Set("height",
+                   Napi::Number::New(c->env, mi.rcMonitor.bottom - mi.rcMonitor.top));
+        // The work area is exactly what GetMonitorInfo reports here, where on
+        // X11 it is an approximation from _NET_WORKAREA.
+        screen.Set("availX", Napi::Number::New(c->env, mi.rcWork.left));
+        screen.Set("availY", Napi::Number::New(c->env, mi.rcWork.top));
+        screen.Set("availWidth",
+                   Napi::Number::New(c->env, mi.rcWork.right - mi.rcWork.left));
+        screen.Set("availHeight",
+                   Napi::Number::New(c->env, mi.rcWork.bottom - mi.rcWork.top));
+        screen.Set("scale", Napi::Number::New(c->env, dpiX / 96.0));
+        screen.Set("primary",
+                   Napi::Boolean::New(c->env, (mi.dwFlags & MONITORINFOF_PRIMARY) != 0));
+        // The primary monitor first, which is the order useScreens() expects.
+        c->out->Set((mi.dwFlags & MONITORINFOF_PRIMARY) ? 0u : ++c->at, screen);
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&collector));
+
+  ::SetThreadDpiAwarenessContext(previous);
+  return out;
+}
+
 Napi::Value Show(const Napi::CallbackInfo& info) {
   Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
   const bool show = info.Length() < 2 || info[1].As<Napi::Boolean>().Value();
@@ -612,6 +734,11 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("scrollRegion", Napi::Function::New(env, ScrollRegion));
   exports.Set("commit", Napi::Function::New(env, Commit));
   exports.Set("resize", Napi::Function::New(env, Resize));
+  exports.Set("setTitle", Napi::Function::New(env, SetTitle));
+  exports.Set("resizeWindow", Napi::Function::New(env, ResizeWindow));
+  exports.Set("moveWindow", Napi::Function::New(env, MoveWindow));
+  exports.Set("destroyWindow", Napi::Function::New(env, DestroyWindow_));
+  exports.Set("listScreens", Napi::Function::New(env, ListScreens));
   InitSurfaceExports(env, exports);
   InitTextExports(env, exports);
   return exports;
