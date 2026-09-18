@@ -24,8 +24,11 @@ let height = 600;
 let pointer = null;
 
 function paintAll() {
-  if (!win32.beginDraw(windowId, 0, 0, width, height)) return;
-  win32.clear(windowId, 0.09, 0.10, 0.13);
+  const s = win32.beginDraw(windowId, 0, 0, width, height);
+  if (!s) return;
+
+  win32.ctxSetFillColor(s, 0.09, 0.1, 0.13, 1);
+  win32.ctxFillRect(s, 0, 0, width, height);
 
   // A row of bars, so the window is obviously drawn rather than blank.
   const bars = 12;
@@ -33,19 +36,24 @@ function paintAll() {
   const barWidth = (width - gap * (bars + 1)) / bars;
   for (let i = 0; i < bars; i++) {
     const t = i / (bars - 1);
-    const tall = 80 + Math.sin(t * Math.PI) * (height - 220);
-    win32.fillRect(
-      windowId,
-      gap + i * (barWidth + gap),
-      height - 60 - tall,
-      barWidth,
-      tall,
-      0.20 + t * 0.55,
-      0.55 - t * 0.2,
-      0.95 - t * 0.35,
-      1,
+    const tall = 80 + Math.sin(t * Math.PI) * (height - 260);
+    win32.ctxSetFillColor(s, 0.2 + t * 0.55, 0.55 - t * 0.2, 0.95 - t * 0.35, 1);
+    win32.ctxBeginPath(s);
+    win32.ctxRoundRect(
+      s, gap + i * (barWidth + gap), height - 60 - tall, barWidth, tall, 4, 4, 4, 4,
     );
+    win32.ctxFill(s, false);
   }
+
+  // DirectWrite, through the same surface handle.
+  const layout = win32.layoutCreate('react-x11 on Windows', {
+    family: 'sans-serif',
+    size: 28,
+    weight: 600,
+  });
+  win32.ctxSetFillColor(s, 0.95, 0.95, 0.97, 1);
+  win32.layoutDraw(s, layout, 24, 28);
+  win32.layoutRelease(layout);
 
   win32.endDraw(windowId);
   win32.commit();
@@ -64,13 +72,19 @@ function paintPointer(x, y) {
   ];
   if (pointer) {
     // Erase where it was, if that is somewhere else.
-    if (win32.beginDraw(windowId, pointer[0], pointer[1], size, size)) {
-      win32.clear(windowId, 0.09, 0.10, 0.13);
+    const s = win32.beginDraw(windowId, pointer[0], pointer[1], size, size);
+    if (s) {
+      win32.ctxSetFillColor(s, 0.09, 0.1, 0.13, 1);
+      win32.ctxFillRect(s, pointer[0], pointer[1], size, size);
       win32.endDraw(windowId);
     }
   }
-  if (win32.beginDraw(windowId, damage[0], damage[1], size, size)) {
-    win32.fillRect(windowId, damage[0], damage[1], size, size, 1, 0.85, 0.2, 1);
+  const s = win32.beginDraw(windowId, damage[0], damage[1], size, size);
+  if (s) {
+    win32.ctxSetFillColor(s, 1, 0.85, 0.2, 1);
+    win32.ctxBeginPath(s);
+    win32.ctxArc(s, damage[0] + size / 2, damage[1] + size / 2, size / 2 - 4, 0, Math.PI * 2, false);
+    win32.ctxFill(s, false);
     win32.endDraw(windowId);
   }
   pointer = damage;

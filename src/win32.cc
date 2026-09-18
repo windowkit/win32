@@ -18,23 +18,22 @@
 // threadsafe function. A window is therefore created asynchronously — the call
 // returns an id at once, and a 'window-ready' event says when the HWND exists.
 
-#include <napi.h>
+#include "bridge.h"
 
-#include <windows.h>
 #include <windowsx.h>
 #include <d3d11.h>
-#include <d2d1_1.h>
-#include <d2d1helper.h>
-#include <dwrite.h>
-#include <dcomp.h>
 #include <dxgi1_2.h>
 
 #include <functional>
-#include <map>
 #include <mutex>
-#include <string>
 #include <thread>
-#include <vector>
+
+// The JS thread's devices. Declared in bridge.h and shared with surface.cc and
+// text.cc, which draw with them.
+ID2D1Device* g_d2dDevice = nullptr;
+ID2D1DeviceContext* g_d2dContext = nullptr;
+IDCompositionDesktopDevice* g_dcomp = nullptr;
+IDWriteFactory3* g_dwrite = nullptr;
 
 namespace {
 
@@ -62,7 +61,10 @@ struct Window {
   IDCompositionTarget* target = nullptr;
   IDCompositionVisual2* visual = nullptr;
   IDCompositionVirtualSurface* surface = nullptr;
-  ID2D1DeviceContext* drawing = nullptr;  // non-null between beginDraw/endDraw
+  // The surface handle the verb table draws through, alive only between
+  // beginDraw and endDraw — the same handle shape an offscreen surface has, so
+  // that src/backend/context2d.js cannot tell the two apart.
+  Surface* drawing = nullptr;
   UINT width = 0;
   UINT height = 0;
 };
@@ -81,11 +83,8 @@ std::vector<std::function<void()>> g_commands;
 Napi::ThreadSafeFunction g_events;
 bool g_eventsOpen = false;
 
-// The JS thread's graphics devices.
 ID3D11Device* g_d3d = nullptr;
 ID2D1Factory1* g_d2dFactory = nullptr;
-ID2D1Device* g_d2dDevice = nullptr;
-IDCompositionDesktopDevice* g_dcomp = nullptr;
 
 Window* LookupWindow(int id) {
   std::lock_guard<std::mutex> lock(g_mutex);
@@ -372,6 +371,16 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
+  hr = ::DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory3),
+                             reinterpret_cast<IUnknown**>(&g_dwrite));
+  if (FAILED(hr)) {
+    Napi::Error::New(env,
+                     "start(): DWriteCreateFactory failed — this backend has no "
+                     "text engine without it")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
   g_events = Napi::ThreadSafeFunction::New(env, info[0].As<Napi::Function>(),
                                            "windowkit-win32-events", 0, 1);
   g_eventsOpen = true;
@@ -462,10 +471,14 @@ Napi::Value Compose(const Napi::CallbackInfo& info) {
 // beginDraw(id, x, y, w, h) — one damage rect. Every pixel inside it is
 // repainted and every pixel outside it is kept, which is the X11 damage model
 // verbatim.
+// Answers a **surface handle**, which is what every ctx verb takes first — so
+// the window's frame and an offscreen bitmap are drawn through exactly the
+// same table, and src/backend/context2d.js cannot tell which it has. Answers 0
+// when the surface refuses, which a caller reads as "no frame this time".
 Napi::Value BeginDraw(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
-  if (!window || !window->surface) return Napi::Boolean::New(env, false);
+  if (!window || !window->surface || window->drawing) return Napi::Number::New(env, 0);
 
   const LONG x = info[1].As<Napi::Number>().Int32Value();
   const LONG y = info[2].As<Napi::Number>().Int32Value();
@@ -476,59 +489,66 @@ Napi::Value BeginDraw(const Napi::CallbackInfo& info) {
   ID2D1DeviceContext* context = nullptr;
   HRESULT hr = window->surface->BeginDraw(&rect, __uuidof(ID2D1DeviceContext),
                                           reinterpret_cast<void**>(&context), &offset);
-  if (FAILED(hr)) return Napi::Boolean::New(env, false);
+  if (FAILED(hr)) return Napi::Number::New(env, 0);
 
+  Surface* surface = new Surface();
+  surface->dc = context;
+  surface->composition = window->surface;
+  surface->width = window->width;
+  surface->height = window->height;
   // The rect lands wherever DirectComposition had room in its texture, so the
-  // offset it hands back is folded into the transform and the caller goes on
-  // drawing in window coordinates.
-  context->SetTransform(D2D1::Matrix3x2F::Translation(
-      static_cast<float>(offset.x - rect.left), static_cast<float>(offset.y - rect.top)));
-  window->drawing = context;
-  return Napi::Boolean::New(env, true);
-}
-
-Napi::Value Clear(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
-  if (!window || !window->drawing) return env.Undefined();
-  window->drawing->Clear(
-      D2D1::ColorF(static_cast<float>(info[1].As<Napi::Number>().DoubleValue()),
-                   static_cast<float>(info[2].As<Napi::Number>().DoubleValue()),
-                   static_cast<float>(info[3].As<Napi::Number>().DoubleValue()), 1.0f));
-  return env.Undefined();
-}
-
-Napi::Value FillRect(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
-  if (!window || !window->drawing) return env.Undefined();
-
-  ID2D1SolidColorBrush* brush = nullptr;
-  window->drawing->CreateSolidColorBrush(
-      D2D1::ColorF(static_cast<float>(info[5].As<Napi::Number>().DoubleValue()),
-                   static_cast<float>(info[6].As<Napi::Number>().DoubleValue()),
-                   static_cast<float>(info[7].As<Napi::Number>().DoubleValue()),
-                   static_cast<float>(info[8].As<Napi::Number>().DoubleValue())),
-      &brush);
-  if (!brush) return env.Undefined();
-
-  const float x = static_cast<float>(info[1].As<Napi::Number>().DoubleValue());
-  const float y = static_cast<float>(info[2].As<Napi::Number>().DoubleValue());
-  const float w = static_cast<float>(info[3].As<Napi::Number>().DoubleValue());
-  const float h = static_cast<float>(info[4].As<Napi::Number>().DoubleValue());
-  window->drawing->FillRectangle(D2D1::RectF(x, y, x + w, y + h), brush);
-  brush->Release();
-  return env.Undefined();
+  // offset it hands back is folded into the base transform and everything above
+  // goes on drawing in window coordinates. Every later transform composes onto
+  // this one, so the fold survives a save/restore.
+  surface->state.transform = D2D1::Matrix3x2F::Translation(
+      static_cast<float>(offset.x - rect.left), static_cast<float>(offset.y - rect.top));
+  SyncTransform(surface);
+  window->drawing = surface;
+  return Napi::Number::New(env, RegisterSurface(surface));
 }
 
 Napi::Value EndDraw(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
   if (!window || !window->drawing) return env.Undefined();
-  window->drawing->Release();
+
+  Surface* surface = window->drawing;
+  // A clip left open would outlive the frame, and Direct2D's EndDraw refuses a
+  // context with an unbalanced push. Unwinding here makes a paint pass that
+  // threw mid-frame cost one frame rather than the window.
+  while (!surface->clips.empty()) {
+    if (surface->clips.back()) {
+      surface->dc->PopLayer();
+    } else {
+      surface->dc->PopAxisAlignedClip();
+    }
+    surface->clips.pop_back();
+  }
+  surface->dc->Release();
+  ForgetSurface(surface->id);
+  delete surface;
   window->drawing = nullptr;
   window->surface->EndDraw();
   return env.Undefined();
+}
+
+// scrollRegion(id, x, y, w, h, dx, dy) — IDCompositionSurface::Scroll, the
+// fast path react-x11's scroll blit takes. The exposed strip is repainted by
+// the frame's own damage.
+Napi::Value ScrollRegion(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
+  if (!window || !window->surface || window->drawing) {
+    return Napi::Boolean::New(env, false);
+  }
+  const LONG x = info[1].As<Napi::Number>().Int32Value();
+  const LONG y = info[2].As<Napi::Number>().Int32Value();
+  RECT rect = {x, y, x + info[3].As<Napi::Number>().Int32Value(),
+               y + info[4].As<Napi::Number>().Int32Value()};
+  const int dx = info[5].As<Napi::Number>().Int32Value();
+  const int dy = info[6].As<Napi::Number>().Int32Value();
+  HRESULT hr = window->surface->Scroll(&rect, &rect, dx, dy);
+  return Napi::Boolean::New(env, SUCCEEDED(hr));
 }
 
 Napi::Value Commit(const Napi::CallbackInfo& info) {
@@ -588,11 +608,12 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("show", Napi::Function::New(env, Show));
   exports.Set("compose", Napi::Function::New(env, Compose));
   exports.Set("beginDraw", Napi::Function::New(env, BeginDraw));
-  exports.Set("clear", Napi::Function::New(env, Clear));
-  exports.Set("fillRect", Napi::Function::New(env, FillRect));
   exports.Set("endDraw", Napi::Function::New(env, EndDraw));
+  exports.Set("scrollRegion", Napi::Function::New(env, ScrollRegion));
   exports.Set("commit", Napi::Function::New(env, Commit));
   exports.Set("resize", Napi::Function::New(env, Resize));
+  InitSurfaceExports(env, exports);
+  InitTextExports(env, exports);
   return exports;
 }
 

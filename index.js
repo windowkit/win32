@@ -9,10 +9,15 @@ const { join } = require('node:path');
 //   1. an explicit path — a bridge checkout under development, or a binary
 //      shipped beside a single-executable build, where `require` has no
 //      node_modules to walk (docs/packaging.md tier 3);
-//   2. the prebuild for this platform and architecture, which is what an
-//      ordinary `npm install` gets;
-//   3. whatever node-gyp last built here, which is what a source install and
-//      a working tree have.
+//   2. whatever node-gyp last built here;
+//   3. the prebuild for this platform and architecture.
+//
+// A source build wins over a prebuild deliberately, and the order was the
+// other way round once: a stale prebuild then silently shadowed a fresh
+// `npm run build`, so the addon under test was not the one just compiled —
+// and nothing said so. A build/ directory only exists when somebody built
+// from source, which is exactly when they mean to be running it; an ordinary
+// install has no build/ and reaches the prebuild on the next line.
 function resolveBinary() {
   const override = process.env.WINDOWKIT_WIN32_PATH;
   if (override) {
@@ -26,9 +31,9 @@ function resolveBinary() {
   }
 
   const candidates = [
-    join(__dirname, 'prebuilds', `${process.platform}-${process.arch}`, 'win32.node'),
     join(__dirname, 'build', 'Release', 'win32.node'),
     join(__dirname, 'build', 'Debug', 'win32.node'),
+    join(__dirname, 'prebuilds', `${process.platform}-${process.arch}`, 'win32.node'),
   ];
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;

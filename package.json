@@ -20,7 +20,7 @@
     "install": "node scripts/install.js",
     "build": "node-gyp rebuild",
     "build:prebuild": "node scripts/prebuild.js",
-    "test": "node test/smoke.js",
+    "test": "node test/smoke.js && node test/text.js",
     "demo": "node examples/window.js"
   },
   "dependencies": {
