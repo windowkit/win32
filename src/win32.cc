@@ -428,6 +428,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       return 0;
     }
     default:
+      // The taskbar's own messages, which src/shell.cc owns: its button
+      // appearing — the first moment a thumbnail toolbar can be added to it,
+      // and again after an Explorer restart — and a click on one of those
+      // buttons. Registered messages have no case label to match on, so the
+      // question is asked here rather than in the switch.
+      if (HandleTaskbarMessage(window->id, message, wparam)) return 0;
       return ::DefWindowProcW(hwnd, message, wparam, lparam);
   }
 }

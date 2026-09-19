@@ -14,10 +14,14 @@
 
 #include "bridge.h"
 
+#include <commctrl.h>
+#include <propkey.h>
+#include <propvarutil.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
 
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -493,6 +497,330 @@ Napi::Value TaskbarFlash(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// --- the taskbar button's own surfaces --------------------------------------
+//
+// Three things the Windows taskbar has that no other desktop does, so none of
+// them is a rung on an existing ladder — they are their own features, and the
+// renderer reports them absent everywhere else rather than pretending.
+//
+// The thumbnail toolbar is the interesting one: up to seven buttons under the
+// taskbar's hover preview, which is where a media player puts play and skip.
+// The Dock has nothing like it and neither does a launcher entry.
+
+// `ThumbBarAddButtons` may be called **once** per window, and only after the
+// shell has made the taskbar button — which it announces with a registered
+// message rather than a documented moment. Everything after the first call has
+// to be `ThumbBarUpdateButtons`, so what was sent is remembered per window.
+struct ThumbBar {
+  std::vector<THUMBBUTTON> buttons;
+  bool added = false;
+  HIMAGELIST icons = nullptr;
+};
+
+std::map<int, ThumbBar> g_thumbBars;
+
+UINT TaskbarButtonCreatedMessage() {
+  static UINT message = ::RegisterWindowMessageW(L"TaskbarButtonCreated");
+  return message;
+}
+
+// Applies what was last asked for. Called again when the shell says the button
+// exists, and when Explorer restarts and says it again.
+// The windows whose taskbar button the shell has said exists.
+//
+// `ThumbBarAddButtons` has to be called *after* that button is there. Called
+// before, it returns S_OK and does nothing — and every later
+// `ThumbBarUpdateButtons` then updates a toolbar that was never added, so the
+// buttons never appear and not one call reported a failure. Which of the two
+// happens first is a race between the shell and the app's first render, so
+// the arrival is remembered rather than waited for.
+std::map<int, bool> g_taskbarButtonExists;
+
+// Applies what was last asked for: when the buttons change, and when the
+// shell says the button exists — including the second time it says it, after
+// an Explorer restart, when the button the toolbar was on is gone.
+void SyncThumbBar(int windowId) {
+  auto it = g_thumbBars.find(windowId);
+  if (it == g_thumbBars.end()) return;
+  ThumbBar& bar = it->second;
+  HWND hwnd = WindowHwnd(windowId);
+  ITaskbarList3* taskbar = Taskbar();
+  if (!hwnd || !taskbar || bar.buttons.empty()) return;
+  if (!g_taskbarButtonExists[windowId]) return;  // nothing to hang them on yet
+
+  if (bar.icons) taskbar->ThumbBarSetImageList(hwnd, bar.icons);
+  if (!bar.added) {
+    if (SUCCEEDED(taskbar->ThumbBarAddButtons(
+            hwnd, static_cast<UINT>(bar.buttons.size()), bar.buttons.data()))) {
+      bar.added = true;
+    }
+    return;
+  }
+  taskbar->ThumbBarUpdateButtons(hwnd, static_cast<UINT>(bar.buttons.size()),
+                                 bar.buttons.data());
+}
+
+// thumbnailToolbar(windowId, [{ id, tooltip, icon, iconWidth, iconHeight,
+//                               enabled, dismissOnClick }])
+//
+// An empty list takes the buttons away — as far as the shell allows, which is
+// to hide them: a toolbar cannot be removed once added, so the buttons are
+// updated to hidden instead, and saying so is better than a call that looks
+// like it worked.
+Napi::Value ThumbnailToolbar(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const int id = info[0].As<Napi::Number>().Int32Value();
+  Napi::Array list = info[1].As<Napi::Array>();
+
+  // The shell takes at most seven, and refuses the whole call for an eighth.
+  const uint32_t count = (std::min)(list.Length(), 7u);
+
+  struct Wanted {
+    UINT id;
+    std::wstring tooltip;
+    std::vector<uint8_t> icon;
+    int iconWidth = 0;
+    int iconHeight = 0;
+    bool enabled = true;
+    bool dismiss = false;
+    bool hidden = false;
+  };
+  std::vector<Wanted> wanted;
+  for (uint32_t i = 0; i < count; i++) {
+    Napi::Object button = list.Get(i).As<Napi::Object>();
+    Wanted one;
+    // The id the click comes back as. The tree names its buttons by string;
+    // this is the index, and the JS half maps back.
+    one.id = i;
+    if (Given(button, "tooltip")) one.tooltip = Wide(button.Get("tooltip"));
+    if (Given(button, "icon")) {
+      Napi::Buffer<uint8_t> pixels = button.Get("icon").As<Napi::Buffer<uint8_t>>();
+      one.icon.assign(pixels.Data(), pixels.Data() + pixels.Length());
+      one.iconWidth = button.Get("iconWidth").As<Napi::Number>().Int32Value();
+      one.iconHeight = button.Get("iconHeight").As<Napi::Number>().Int32Value();
+    }
+    if (Given(button, "enabled")) one.enabled = button.Get("enabled").ToBoolean().Value();
+    if (Given(button, "dismissOnClick")) {
+      one.dismiss = button.Get("dismissOnClick").ToBoolean().Value();
+    }
+    wanted.push_back(std::move(one));
+  }
+
+  PostToUiThread([id, wanted]() {
+    ThumbBar& bar = g_thumbBars[id];
+
+    // One image list for the lot: THUMBBUTTON carries an index into it, not
+    // an icon. Rebuilt each time, because a button's icon can change and the
+    // list is the only place it lives.
+    HIMAGELIST icons =
+        ::ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK,
+                           static_cast<int>(wanted.size()), 1);
+    int at = 0;
+    for (const Wanted& one : wanted) {
+      if (one.icon.empty()) continue;
+      HICON icon = IconFromPixels(one.icon.data(), one.iconWidth, one.iconHeight);
+      if (!icon) continue;
+      ::ImageList_AddIcon(icons, icon);
+      ::DestroyIcon(icon);
+      at++;
+    }
+
+    std::vector<THUMBBUTTON> buttons;
+    int iconAt = 0;
+    for (const Wanted& one : wanted) {
+      THUMBBUTTON button = {};
+      button.dwMask = THB_FLAGS;
+      button.iId = one.id;
+      if (!one.icon.empty()) {
+        button.dwMask = static_cast<THUMBBUTTONMASK>(button.dwMask | THB_BITMAP);
+        button.iBitmap = iconAt++;
+      }
+      if (!one.tooltip.empty()) {
+        button.dwMask = static_cast<THUMBBUTTONMASK>(button.dwMask | THB_TOOLTIP);
+        ::wcsncpy_s(button.szTip, one.tooltip.c_str(), _TRUNCATE);
+      }
+      button.dwFlags = one.enabled ? THBF_ENABLED : THBF_DISABLED;
+      if (one.dismiss) {
+        button.dwFlags = static_cast<THUMBBUTTONFLAGS>(button.dwFlags | THBF_DISMISSONCLICK);
+      }
+      buttons.push_back(button);
+    }
+
+    // Nothing asked for, but a toolbar already added: the shell has no way to
+    // take one away, so the buttons are hidden instead.
+    if (buttons.empty() && bar.added) {
+      for (THUMBBUTTON& button : bar.buttons) {
+        button.dwMask = static_cast<THUMBBUTTONMASK>(button.dwMask | THB_FLAGS);
+        button.dwFlags = THBF_HIDDEN;
+      }
+      SyncThumbBar(id);
+      if (icons) ::ImageList_Destroy(icons);
+      return;
+    }
+
+    if (bar.icons) ::ImageList_Destroy(bar.icons);
+    bar.icons = at > 0 ? icons : nullptr;
+    if (at == 0 && icons) ::ImageList_Destroy(icons);
+    bar.buttons = buttons;
+    SyncThumbBar(id);
+  });
+  (void)env;
+  return Napi::Boolean::New(env, true);
+}
+
+}  // namespace
+
+// Two messages the taskbar sends that only this file knows what to do with,
+// so win32.cc hands them over rather than learning the shell's vocabulary.
+//
+// `TaskbarButtonCreated` is registered rather than numbered, and it is the
+// only signal that a window's taskbar button exists — which is the first
+// moment a thumbnail toolbar can be added to it. It arrives again when
+// Explorer restarts, and everything hung on the button has to be applied
+// again then, which is why the buttons are remembered rather than forgotten
+// once sent.
+bool HandleTaskbarMessage(int windowId, UINT message, WPARAM wparam) {
+  if (message == TaskbarButtonCreatedMessage()) {
+    // Explorer restarting sends this again, and the toolbar has to be
+    // added again with it: the button it was on is gone.
+    g_taskbarButtonExists[windowId] = true;
+    {
+      auto bar = g_thumbBars.find(windowId);
+      if (bar != g_thumbBars.end()) bar->second.added = false;
+    }
+    SyncThumbBar(windowId);
+    return true;
+  }
+  if (message == WM_COMMAND && HIWORD(wparam) == THBN_CLICKED) {
+    EmitEvent("thumbbutton", windowId, LOWORD(wparam));
+    return true;
+  }
+  return false;
+}
+
+namespace {
+
+// recentDocument(path) — the Recent list in the jump list and in Explorer's
+// quick access. One call, and the shell decides where it shows: this is the
+// same act as macOS's `noteNewRecentDocumentURL:`.
+//
+// It only lands where the file type is associated with this application, which
+// for an unpackaged app means it may go nowhere at all — so this reports what
+// it did rather than claiming success.
+Napi::Value RecentDocument(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info[0].IsNull() || info[0].IsUndefined()) {
+    PostToUiThread([]() { ::SHAddToRecentDocs(SHARD_PATHW, nullptr); });
+    return Napi::Boolean::New(env, true);
+  }
+  const std::wstring path = Wide(info[0]);
+  PostToUiThread([path]() { ::SHAddToRecentDocs(SHARD_PATHW, path.c_str()); });
+  return Napi::Boolean::New(env, true);
+}
+
+// jumpList([{ title, arguments, description }]) — the Tasks category of this
+// application's jump list, which is what `useDockMenu` means here.
+//
+// Each task relaunches this executable with the arguments given. Without the
+// single-instance path (docs/windows-integrations.md) that starts a second
+// copy rather than talking to the first, which is what most applications
+// shipping a jump list actually do, and is why this is worth having before
+// activation is built rather than after.
+//
+// An empty list deletes the category, which is how a jump list is taken away.
+Napi::Value JumpList(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Array list = info[1].IsArray() ? info[1].As<Napi::Array>()
+                                       : info[0].As<Napi::Array>();
+  struct Task {
+    std::wstring title;
+    std::wstring args;
+    std::wstring description;
+  };
+  std::vector<Task> tasks;
+  for (uint32_t i = 0; i < list.Length(); i++) {
+    Napi::Object item = list.Get(i).As<Napi::Object>();
+    Task task;
+    if (Given(item, "title")) task.title = Wide(item.Get("title"));
+    if (Given(item, "arguments")) task.args = Wide(item.Get("arguments"));
+    if (Given(item, "description")) task.description = Wide(item.Get("description"));
+    if (!task.title.empty()) tasks.push_back(std::move(task));
+  }
+
+  PostToUiThread([tasks]() {
+    ICustomDestinationList* destinations = nullptr;
+    if (FAILED(::CoCreateInstance(CLSID_DestinationList, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&destinations)))) {
+      return;
+    }
+    UINT slots = 0;
+    IObjectArray* removed = nullptr;
+    if (FAILED(destinations->BeginList(&slots, IID_PPV_ARGS(&removed)))) {
+      destinations->Release();
+      return;
+    }
+    if (removed) removed->Release();
+
+    if (tasks.empty()) {
+      destinations->DeleteList(nullptr);
+      destinations->Release();
+      return;
+    }
+
+    IObjectCollection* collection = nullptr;
+    if (FAILED(::CoCreateInstance(CLSID_EnumerableObjectCollection, nullptr,
+                                  CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&collection)))) {
+      destinations->AbortList();
+      destinations->Release();
+      return;
+    }
+
+    wchar_t self[MAX_PATH] = {};
+    ::GetModuleFileNameW(nullptr, self, MAX_PATH);
+
+    for (const Task& task : tasks) {
+      IShellLinkW* link = nullptr;
+      if (FAILED(::CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(&link)))) {
+        continue;
+      }
+      link->SetPath(self);
+      if (!task.args.empty()) link->SetArguments(task.args.c_str());
+      if (!task.description.empty()) link->SetDescription(task.description.c_str());
+      // The icon is this executable's own. A task with no icon at all is
+      // drawn blank, which reads as broken rather than plain.
+      link->SetIconLocation(self, 0);
+
+      // The title is not a property of the link, it is a property of the
+      // shell item the link is: `System.Title` on its property store.
+      IPropertyStore* properties = nullptr;
+      if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&properties)))) {
+        PROPVARIANT title = {};
+        if (SUCCEEDED(::InitPropVariantFromString(task.title.c_str(), &title))) {
+          properties->SetValue(PKEY_Title, title);
+          properties->Commit();
+          ::PropVariantClear(&title);
+        }
+        properties->Release();
+      }
+      collection->AddObject(link);
+      link->Release();
+    }
+
+    IObjectArray* array = nullptr;
+    if (SUCCEEDED(collection->QueryInterface(IID_PPV_ARGS(&array)))) {
+      destinations->AddUserTasks(array);
+      destinations->CommitList();
+      array->Release();
+    } else {
+      destinations->AbortList();
+    }
+    collection->Release();
+    destinations->Release();
+  });
+  return Napi::Boolean::New(env, true);
+}
+
 // --- file dialogs -----------------------------------------------------------
 
 int g_nextDialogId = 1;
@@ -729,4 +1057,7 @@ void InitShellExports(Napi::Env env, Napi::Object exports) {
   set("trayNotify", TrayNotify);
   set("keepAwake", KeepAwake);
   set("lastInputMs", LastInputMs);
+  set("thumbnailToolbar", ThumbnailToolbar);
+  set("recentDocument", RecentDocument);
+  set("jumpList", JumpList);
 }

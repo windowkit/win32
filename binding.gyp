@@ -34,7 +34,8 @@
             "-lshell32.lib",
             "-lshlwapi.lib",
             "-lole32.lib",
-            "-lcomctl32.lib"
+            "-lcomctl32.lib",
+            "-lpropsys.lib"
           ],
           "msvs_settings": {
             "VCCLCompilerTool": {

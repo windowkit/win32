@@ -129,4 +129,8 @@ void InitBezelExports(Napi::Env env, Napi::Object exports);
 void InitGlExports(Napi::Env env, Napi::Object exports);
 void InitShellExports(Napi::Env env, Napi::Object exports);
 void InitDndExports(Napi::Env env, Napi::Object exports);
+
+// The taskbar's own messages — the button appearing, and a thumbnail
+// toolbar button being clicked. True when it was one of them.
+bool HandleTaskbarMessage(int windowId, UINT message, WPARAM wparam);
 void InitGlContextExports(Napi::Env env, Napi::Object exports);
