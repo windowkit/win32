@@ -150,6 +150,43 @@ void DrainCommands() {
 // The UI thread
 // ---------------------------------------------------------------------------
 
+// --- the frame ------------------------------------------------------------
+//
+// The title bar, the borders and the buttons are DWM's, not ours: a
+// WS_OVERLAPPEDWINDOW has its whole non-client area drawn by the compositor,
+// and nothing this bridge paints reaches it. What it *will* take is a hint,
+// and without one every window came up with a light title bar over dark
+// content — the app looking like it belonged to a different desktop than
+// everything else on the screen.
+//
+// DWMWA_USE_IMMERSIVE_DARK_MODE is the hint. It changed number once: 19 on
+// Windows 10 builds 17763..18362, 20 from 18985 and on Windows 11. Asking
+// for the new one first and falling back costs one failed call on an old
+// build and keeps the code free of a version check that would have to be
+// kept true.
+constexpr DWORD kUseImmersiveDarkMode = 20;
+constexpr DWORD kUseImmersiveDarkModeBefore20H1 = 19;
+
+bool SystemPrefersDark() {
+  DWORD light = 1;
+  DWORD size = sizeof(light);
+  ::RegGetValueW(
+      HKEY_CURRENT_USER,
+      L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+      L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
+  return light == 0;
+}
+
+void ApplyFrameTheme(HWND hwnd, bool dark) {
+  if (!hwnd) return;
+  const BOOL value = dark ? TRUE : FALSE;
+  if (FAILED(::DwmSetWindowAttribute(hwnd, kUseImmersiveDarkMode, &value,
+                                     sizeof(value)))) {
+    ::DwmSetWindowAttribute(hwnd, kUseImmersiveDarkModeBefore20H1, &value,
+                            sizeof(value));
+  }
+}
+
 // --- the keyboard ----------------------------------------------------------
 //
 // A key press is three facts, not one: which key it was, what it typed, and
@@ -360,6 +397,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       // as one of these three, broadcast to every top-level window. Which one
       // it was does not matter: the appearance is re-read whole, because the
       // ladder's rule is that one rung owns every field.
+      // The frame is DWM's and it does not re-ask: a window told "dark" once
+      // stays dark through a switch to light unless it is told again.
+      ApplyFrameTheme(hwnd, SystemPrefersDark());
       Emit(Event{"appearance", window->id});
       // …and Windows still gets it. WM_SETTINGCHANGE in particular is acted on
       // by the default procedure, and swallowing it leaves the frame out of
@@ -656,6 +696,9 @@ Napi::Value CreateWindowExport(const Napi::CallbackInfo& info) {
       return;
     }
     ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(window));
+    // Before the window is ever shown: asking afterwards repaints the frame,
+    // which is a visible flash from light to dark on every launch.
+    ApplyFrameTheme(hwnd, SystemPrefersDark());
     {
       std::lock_guard<std::mutex> lock(g_mutex);
       window->hwnd = hwnd;
