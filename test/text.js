@@ -92,6 +92,40 @@ assert.deepStrictEqual(
 assert.deepStrictEqual(at(21, 21), [255, 0, 0, 255], 'the roundRect has square corners');
 
 
+// --- variable axes ----------------------------------------------------------
+//
+// Bahnschrift ships with Windows and has two axes, `wght` and `wdth`, so the
+// measurement below is against a face every machine running this test has.
+// Width is the axis to measure with: moving it changes the advance, where a
+// weight change on a grotesque may not move the line at all.
+
+const AXIS_TEXT = 'Sphinx of black quartz, judge my vow';
+function axisWidth(variations) {
+  const handle = win32.layoutCreate(
+    AXIS_TEXT,
+    { family: 'Bahnschrift', size: 30, variations },
+    [{ start: 0, length: AXIS_TEXT.length, family: 'Bahnschrift', size: 30, variations }],
+  );
+  const width = win32.layoutMetrics(handle).width;
+  win32.layoutRelease(handle);
+  return width;
+}
+
+const plain = axisWidth(undefined);
+const narrow = axisWidth({ wdth: 75 });
+console.log(`axes      : Bahnschrift is ${plain}px wide, ${narrow}px at wdth 75`);
+assert.ok(plain > 0, 'the layout measured nothing');
+assert.ok(
+  narrow < plain * 0.9,
+  `wdth 75 measured ${narrow} against ${plain} — the axis did not reach the ` +
+    'face, which is what a layout looks like when the axis values are set ' +
+    'but automatic axes are still deriving them from the format',
+);
+// A tag that is not four characters is not an axis tag, and one the face does
+// not have is not an error — both leave the face at its default instance.
+assert.equal(axisWidth({ notatag: 5 }), plain, 'a bad axis tag changed the layout');
+assert.equal(axisWidth({ slnt: -10 }), plain, 'an absent axis changed the width');
+
 // --- glyph runs -------------------------------------------------------------
 //
 // The seam a grid renderer draws through: a face resolved to a handle, a cmap

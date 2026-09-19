@@ -89,9 +89,62 @@ std::wstring ResolveFamily(const std::wstring& family) {
 // collection only for a family that is actually in it, and nullptr — meaning
 // the system collection — for everything else.
 
-std::vector<IDWriteFontFile*> g_loadedFiles;
+// A file the app loaded, and the name it asked for it under.
+//
+// `family` empty means "whatever the file calls itself". A caller that names
+// one is renaming the face for this process — `loadFont(app, path, { family })`
+// — and a `postscriptName` alongside it narrows the rename to the one face in
+// the file with that name, which is what a specimen needs: a PostScript name
+// is one face by definition, where a family is as many as the file holds.
+struct LoadedFile {
+  IDWriteFontFile* file = nullptr;
+  std::wstring family;
+  std::wstring postscriptName;
+};
+
+std::vector<LoadedFile> g_loadedFiles;
 IDWriteFontCollection1* g_loaded = nullptr;
 IDWriteInMemoryFontFileLoader* g_memoryLoader = nullptr;
+
+// The faces of one file, as a font set — which is not the same list as the
+// file's faces.
+//
+// `Analyze` counts the faces a file physically holds: for a variable font
+// that is one, whatever the designer named inside it. A font set built from
+// the file expands that one face into its named instances, each with its own
+// axis values and its own PostScript name — `Bahnschrift-Light`,
+// `Bahnschrift-SemiCondensed` — which is the list the system collection shows
+// and the list a caller naming a face means.
+IDWriteFontSet* FontSetOf(IDWriteFontFile* file) {
+  IDWriteFontSetBuilder* builder = nullptr;
+  if (FAILED(g_dwrite->CreateFontSetBuilder(&builder))) return nullptr;
+  IDWriteFontSetBuilder1* builder1 = nullptr;
+  builder->QueryInterface(__uuidof(IDWriteFontSetBuilder1),
+                          reinterpret_cast<void**>(&builder1));
+  bool added = false;
+  if (builder1) added = SUCCEEDED(builder1->AddFontFile(file));
+  if (!added) {
+    BOOL supported = FALSE;
+    DWRITE_FONT_FILE_TYPE fileType = DWRITE_FONT_FILE_TYPE_UNKNOWN;
+    DWRITE_FONT_FACE_TYPE faceType = DWRITE_FONT_FACE_TYPE_UNKNOWN;
+    UINT32 faces = 0;
+    if (SUCCEEDED(file->Analyze(&supported, &fileType, &faceType, &faces)) && supported) {
+      for (UINT32 face = 0; face < faces; face++) {
+        IDWriteFontFaceReference* reference = nullptr;
+        if (SUCCEEDED(g_dwrite->CreateFontFaceReference(
+                file, face, DWRITE_FONT_SIMULATIONS_NONE, &reference))) {
+          builder->AddFontFaceReference(reference);
+          reference->Release();
+        }
+      }
+    }
+  }
+  IDWriteFontSet* set = nullptr;
+  builder->CreateFontSet(&set);
+  if (builder1) builder1->Release();
+  builder->Release();
+  return set;
+}
 
 void RebuildLoadedCollection() {
   if (g_loaded) {
@@ -101,24 +154,68 @@ void RebuildLoadedCollection() {
   if (g_loadedFiles.empty()) return;
   IDWriteFontSetBuilder* builder = nullptr;
   if (FAILED(g_dwrite->CreateFontSetBuilder(&builder))) return;
-  for (IDWriteFontFile* file : g_loadedFiles) {
-    BOOL supported = FALSE;
-    DWRITE_FONT_FILE_TYPE fileType = DWRITE_FONT_FILE_TYPE_UNKNOWN;
-    DWRITE_FONT_FACE_TYPE faceType = DWRITE_FONT_FACE_TYPE_UNKNOWN;
-    UINT32 faces = 0;
-    if (FAILED(file->Analyze(&supported, &fileType, &faceType, &faces)) || !supported) {
+  IDWriteFontSetBuilder1* builder1 = nullptr;
+  builder->QueryInterface(__uuidof(IDWriteFontSetBuilder1),
+                          reinterpret_cast<void**>(&builder1));
+
+  for (const LoadedFile& loaded : g_loadedFiles) {
+    // The plain case: the file under its own name, through `AddFontFile`
+    // rather than a reference per face, because a face *reference* names one
+    // instance. A font set built from references holds Bahnschrift at its
+    // default weight and width with no axes left to set, so `variations` on a
+    // loaded face silently did nothing while the same family through the
+    // system collection varied fine.
+    //
+    // A rename cannot take that path, and this is a platform limit rather
+    // than a choice: the only add that carries a property override is
+    // `AddFontFaceReference`, and a reference is an instance. So a renamed
+    // variable font is registered at the instance the caller named — the
+    // right face, at a fixed point on its axes. An app that wants to move
+    // along them names the file's own family instead, which is what
+    // `loadFont` returns when no `family` is passed.
+    if (loaded.family.empty() && builder1 &&
+        SUCCEEDED(builder1->AddFontFile(loaded.file))) {
       continue;
     }
-    for (UINT32 face = 0; face < faces; face++) {
-      IDWriteFontFaceReference* reference = nullptr;
-      if (SUCCEEDED(g_dwrite->CreateFontFaceReference(file, face,
-                                                      DWRITE_FONT_SIMULATIONS_NONE,
-                                                      &reference))) {
-        builder->AddFontFaceReference(reference);
-        reference->Release();
+
+    IDWriteFontSet* set = FontSetOf(loaded.file);
+    if (!set) continue;
+    // Narrowed to one face where the caller named one. DirectWrite does the
+    // matching, against the same PostScript names `listFonts` reports, so the
+    // name that came out of the catalogue is the name that goes back in.
+    if (!loaded.postscriptName.empty()) {
+      DWRITE_FONT_PROPERTY wanted = {DWRITE_FONT_PROPERTY_ID_POSTSCRIPT_NAME,
+                                     loaded.postscriptName.c_str(), nullptr};
+      IDWriteFontSet* matched = nullptr;
+      if (SUCCEEDED(set->GetMatchingFonts(&wanted, 1, &matched)) && matched &&
+          matched->GetFontCount() > 0) {
+        set->Release();
+        set = matched;
+      } else if (matched) {
+        matched->Release();
       }
     }
+
+    const UINT32 count = set->GetFontCount();
+    for (UINT32 i = 0; i < count; i++) {
+      IDWriteFontFaceReference* reference = nullptr;
+      if (FAILED(set->GetFontFaceReference(i, &reference)) || !reference) continue;
+      if (loaded.family.empty()) {
+        builder->AddFontFaceReference(reference);
+      } else {
+        // Only the family name is overridden. Weight, style and stretch are
+        // read off the face, because a rename is about reaching the face, not
+        // about lying about what it is.
+        DWRITE_FONT_PROPERTY properties[] = {
+            {DWRITE_FONT_PROPERTY_ID_FAMILY_NAME, loaded.family.c_str(), L"en-US"},
+        };
+        builder->AddFontFaceReference(reference, properties, 1);
+      }
+      reference->Release();
+    }
+    set->Release();
   }
+  if (builder1) builder1->Release();
   IDWriteFontSet* set = nullptr;
   if (SUCCEEDED(builder->CreateFontSet(&set))) {
     g_dwrite->CreateFontCollectionFromFontSet(set, &g_loaded);
@@ -222,13 +319,28 @@ Napi::Value FontLoad(const Napi::CallbackInfo& info) {
     return env.Null();
   }
 
-  const std::wstring family = FirstFamilyOf(file);
-  g_loadedFiles.push_back(file);
+  // The name the caller asked for, or the file's own. An app that ships a
+  // font writes `fontFamily: 'Inter'` and means the file's name; the fonts
+  // app names one *face* of a family and needs the renaming form, or a
+  // specimen of Bahnschrift Light draws in Bahnschrift Regular — or, when
+  // nothing resolves the name at all, in the default sans.
+  std::wstring family;
+  std::wstring postscriptName;
+  if (info.Length() > 1 && info[1].IsObject()) {
+    Napi::Object options = info[1].As<Napi::Object>();
+    if (Given(options, "family")) family = Wide(options.Get("family"));
+    if (Given(options, "postscriptName")) {
+      postscriptName = Wide(options.Get("postscriptName"));
+    }
+  }
+  const std::wstring own = FirstFamilyOf(file);
+  g_loadedFiles.push_back({file, family, postscriptName});
   RebuildLoadedCollection();
 
   Napi::Object out = Napi::Object::New(env);
-  out.Set("family", Napi::String::New(
-                        env, reinterpret_cast<const char16_t*>(family.c_str())));
+  out.Set("family",
+          Napi::String::New(env, reinterpret_cast<const char16_t*>(
+                                     (family.empty() ? own : family).c_str())));
   return out;
 }
 
@@ -316,6 +428,61 @@ LineExtents ExtentsOf(IDWriteTextLayout* layout, UINT32 start, UINT32 end) {
 // applied as formatting ranges over the one string — which is what makes a
 // paragraph of mixed <text> chunks a single IDWriteTextLayout rather than one
 // per chunk, and therefore what makes line breaking work across them.
+// A variable font's axes, as `{ wght: 700, wdth: 87.5 }`.
+//
+// DirectWrite takes them as DWRITE_FONT_AXIS_VALUE on the layout, which is
+// IDWriteTextLayout4 — DirectWrite 3, Windows 10 1809 and on. Older builds
+// answer the QueryInterface with nothing and the text draws at the face's
+// default instance, which is the same thing an app gets on a backend with no
+// variable font support at all: the right picture for the wrong reason, and
+// better than refusing to draw.
+//
+// DirectWrite's automatic axes are left on. It derives `wght`, `ital` and
+// `opsz` from the format's weight, style and size, and the question was
+// whether those sit on top of the values named here — measured, they do not:
+// at format weight 400, `{ wght: 300 }` and `{ wght: 700 }` draw 1690 and
+// 2619 lit pixels of the same string against 2135 for the default. An
+// explicit value wins, and what automatic axes still do is fill in the ones
+// the caller did not name, which is where an `opsz` that follows the font
+// size comes from.
+bool ApplyAxes(IDWriteTextLayout* layout, const Napi::Value& value,
+               DWRITE_TEXT_RANGE range) {
+  if (!layout || !value.IsObject() || value.IsNull()) return false;
+  Napi::Object axes = value.As<Napi::Object>();
+  Napi::Array tags = axes.GetPropertyNames();
+  if (tags.Length() == 0) return false;
+
+  std::vector<DWRITE_FONT_AXIS_VALUE> values;
+  for (uint32_t i = 0; i < tags.Length(); i++) {
+    const std::string tag = tags.Get(i).As<Napi::String>().Utf8Value();
+    // Four bytes, little-endian, which is how DWRITE_MAKE_FONT_AXIS_TAG packs
+    // them. A tag of any other length is not an axis tag.
+    if (tag.size() != 4) continue;
+    Napi::Value raw = axes.Get(tags.Get(i));
+    if (!raw.IsNumber()) continue;
+    DWRITE_FONT_AXIS_VALUE axis = {};
+    axis.axisTag = static_cast<DWRITE_FONT_AXIS_TAG>(
+        static_cast<UINT32>(static_cast<unsigned char>(tag[0])) |
+        (static_cast<UINT32>(static_cast<unsigned char>(tag[1])) << 8) |
+        (static_cast<UINT32>(static_cast<unsigned char>(tag[2])) << 16) |
+        (static_cast<UINT32>(static_cast<unsigned char>(tag[3])) << 24));
+    axis.value = static_cast<FLOAT>(raw.As<Napi::Number>().DoubleValue());
+    values.push_back(axis);
+  }
+  if (values.empty()) return false;
+
+  IDWriteTextLayout4* layout4 = nullptr;
+  if (FAILED(layout->QueryInterface(__uuidof(IDWriteTextLayout4),
+                                    reinterpret_cast<void**>(&layout4))) ||
+      !layout4) {
+    return false;
+  }
+  const HRESULT hr = layout4->SetFontAxisValues(
+      values.data(), static_cast<UINT32>(values.size()), range);
+  layout4->Release();
+  return SUCCEEDED(hr);
+}
+
 Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (!g_dwrite) {
@@ -394,6 +561,11 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
   entry->layout = layout;
   entry->text = text;
 
+  const DWRITE_TEXT_RANGE whole = {0, static_cast<UINT32>(text.size())};
+  if (Given(options, "variations")) {
+    ApplyAxes(layout, options.Get("variations"), whole);
+  }
+
   if (info.Length() > 2 && info[2].IsArray()) {
     Napi::Array spans = info[2].As<Napi::Array>();
     for (uint32_t i = 0; i < spans.Length(); i++) {
@@ -423,6 +595,9 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
                                  ? DWRITE_FONT_STYLE_ITALIC
                                  : DWRITE_FONT_STYLE_NORMAL,
                              range);
+      }
+      if (Given(span, "variations")) {
+        ApplyAxes(layout, span.Get("variations"), range);
       }
       if (Given(span, "underline")) {
         layout->SetUnderline(span.Get("underline").ToBoolean().Value(), range);
