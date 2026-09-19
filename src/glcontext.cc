@@ -503,6 +503,8 @@ bool EnsurePresentation(GlSurface* surface) {
     return false;
   }
 
+  // The flip pivots about the surface height, which just changed.
+  PlaceVisual(surface);
   surface->builtWidth = width;
   surface->builtHeight = height;
   return true;
@@ -514,6 +516,19 @@ void PlaceVisual(GlSurface* surface) {
   if (!surface->visual) return;
   surface->visual->SetOffsetX(static_cast<float>(surface->x.load()));
   surface->visual->SetOffsetY(static_cast<float>(surface->y.load()));
+  // Flip it back up the right way.
+  //
+  // OpenGL's framebuffer starts at the bottom-left and a Direct3D texture's
+  // first row is the top one, so a frame GL renders into a shared texture
+  // arrives here upside down. Nothing in the GL half should be bent to fix
+  // that — `glReadPixels` and `gl_FragCoord` have to keep answering in GL's
+  // own coordinates, or every shader an app writes would be wrong instead.
+  // So the flip happens at the very end, where the surface is placed: the
+  // composition visual mirrors its content about the middle of its own
+  // height, which costs nothing because the compositor was going to transform
+  // it anyway.
+  const float height = static_cast<float>(surface->height.load());
+  surface->visual->SetTransform(D2D1::Matrix3x2F(1, 0, 0, -1, 0, height));
   g_dcomp->Commit();
 }
 
