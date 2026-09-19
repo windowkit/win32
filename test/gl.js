@@ -28,14 +28,22 @@ const waitFor = (type, ms = 5000) =>
     }, 25);
   });
 
-const VERTEX = `#version 330 core
-layout(location = 0) in vec2 a_pos;
-void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
+// GLSL ES 1.00, written the way a `<glarea>` app writes it: no `#version`
+// line, `attribute`/`varying`, `gl_FragColor`. The `mat3(mat4)` cast is here
+// on purpose — it is legal in ES 1.00 and not until 1.20 on the desktop, so
+// a context that is quietly desktop GL fails this and says so.
+const VERTEX = `
+attribute vec2 a_pos;
+uniform mat4 u_model;
+void main() {
+  vec3 shifted = mat3(u_model) * vec3(a_pos, 1.0);
+  gl_Position = vec4(shifted.xy, 0.0, 1.0);
+}
 `;
 
-const FRAGMENT = `#version 330 core
-out vec4 fragColor;
-void main() { fragColor = vec4(1.0, 0.5, 0.0, 1.0); }
+const FRAGMENT = `
+precision mediump float;
+void main() { gl_FragColor = vec4(1.0, 0.5, 0.0, 1.0); }
 `;
 
 async function main() {
@@ -95,6 +103,7 @@ async function main() {
   const program = gl.createProgram();
   gl.attachShader(program, vs);
   gl.attachShader(program, fs);
+  gl.bindAttribLocation(program, 0, 'a_pos');
   gl.linkProgram(program);
   assert.ok(
     gl.getProgramParameter(program, 0x8b82 /* LINK_STATUS */),
@@ -116,6 +125,11 @@ async function main() {
   gl.vertexAttribPointer(0, 2, 0x1406 /* FLOAT */, false, 0, 0);
 
   gl.useProgram(program);
+  gl.uniformMatrix4fv(
+    gl.getUniformLocation(program, 'u_model'),
+    false,
+    new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]),
+  );
   gl.drawArrays(4 /* TRIANGLES */, 0, 3);
   gl.finish();
 

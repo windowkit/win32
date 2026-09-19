@@ -37,6 +37,9 @@ constexpr int WGL_CONTEXT_MAJOR_VERSION_ARB = 0x2091;
 constexpr int WGL_CONTEXT_MINOR_VERSION_ARB = 0x2092;
 constexpr int WGL_CONTEXT_PROFILE_MASK_ARB = 0x9126;
 constexpr int WGL_CONTEXT_CORE_PROFILE_BIT_ARB = 0x00000001;
+// WGL_EXT_create_context_es2_profile: an OpenGL ES context, which is the
+// dialect a WebGL-shaped table is written against.
+constexpr int WGL_CONTEXT_ES_PROFILE_BIT_EXT = 0x00000004;
 
 namespace {
 
@@ -559,7 +562,7 @@ Napi::Value GlCreateSurface(const Napi::CallbackInfo& info) {
     HWND hwnd = ::CreateWindowExW(0, kGlClass, L"", WS_POPUP, 0, 0, 1, 1, nullptr,
                                   nullptr, instance, nullptr);
     if (!hwnd) {
-      EmitEvent("gl-ready", surface->id, 0);
+      EmitEvent("gl-ready", surface->id, 0, 1);
       return;
     }
 
@@ -576,7 +579,7 @@ Napi::Value GlCreateSurface(const Napi::CallbackInfo& info) {
     if (!format || !::SetPixelFormat(dc, format, &pfd)) {
       ::ReleaseDC(hwnd, dc);
       ::DestroyWindow(hwnd);
-      EmitEvent("gl-ready", surface->id, 0);
+      EmitEvent("gl-ready", surface->id, 0, 2);
       return;
     }
 
@@ -589,7 +592,7 @@ Napi::Value GlCreateSurface(const Napi::CallbackInfo& info) {
       if (legacy) ::wglDeleteContext(legacy);
       ::ReleaseDC(hwnd, dc);
       ::DestroyWindow(hwnd);
-      EmitEvent("gl-ready", surface->id, 0);
+      EmitEvent("gl-ready", surface->id, 0, 3);
       return;
     }
 
@@ -607,12 +610,35 @@ Napi::Value GlCreateSurface(const Napi::CallbackInfo& info) {
         ::wglGetProcAddress("wglCreateContextAttribsARB"));
     HGLRC context = nullptr;
     if (createAttribs) {
-      const int versions[][2] = {{4, 6}, {4, 3}, {3, 3}};
-      for (const auto& v : versions) {
-        const int attribs[] = {WGL_CONTEXT_MAJOR_VERSION_ARB, v[0],
-                               WGL_CONTEXT_MINOR_VERSION_ARB, v[1],
-                               WGL_CONTEXT_PROFILE_MASK_ARB,
-                               WGL_CONTEXT_CORE_PROFILE_BIT_ARB, 0};
+      // OpenGL ES first, desktop core second.
+      //
+      // What `<glarea>` is handed is a WebGL-shaped table, so what apps write
+      // against it is GLSL ES — `attribute`, `varying`, `gl_FragColor`, and
+      // no `#version` line, because ES 1.00 is the default there. A desktop
+      // context compiles a source with no `#version` as desktop GLSL *1.10*,
+      // which is a different language in small, surprising ways: `mat3(m4)`
+      // is legal in ES 1.00 and not until 1.20 on the desktop, and a scene
+      // whose only sin is a normal matrix fails to compile with an error
+      // about a version it never asked for.
+      //
+      // So ask for the dialect the caller is actually writing. The desktop
+      // rungs stay behind it for a driver with no ES profile — a shader
+      // without matrix casts compiles on both, which is why this was not
+      // noticed until a scene used one.
+      struct Profile {
+        int major, minor, mask;
+      };
+      const Profile profiles[] = {
+          {3, 0, WGL_CONTEXT_ES_PROFILE_BIT_EXT},
+          {2, 0, WGL_CONTEXT_ES_PROFILE_BIT_EXT},
+          {4, 6, WGL_CONTEXT_CORE_PROFILE_BIT_ARB},
+          {4, 3, WGL_CONTEXT_CORE_PROFILE_BIT_ARB},
+          {3, 3, WGL_CONTEXT_CORE_PROFILE_BIT_ARB},
+      };
+      for (const Profile& p : profiles) {
+        const int attribs[] = {WGL_CONTEXT_MAJOR_VERSION_ARB, p.major,
+                               WGL_CONTEXT_MINOR_VERSION_ARB, p.minor,
+                               WGL_CONTEXT_PROFILE_MASK_ARB, p.mask, 0};
         context = createAttribs(dc, share, attribs);
         if (context) break;
       }
@@ -626,7 +652,7 @@ Napi::Value GlCreateSurface(const Napi::CallbackInfo& info) {
       // reported as one — docs/windows-gl.md's rung 2 is where this goes.
       ::ReleaseDC(hwnd, dc);
       ::DestroyWindow(hwnd);
-      EmitEvent("gl-ready", surface->id, 0);
+      EmitEvent("gl-ready", surface->id, 0, 4);
       return;
     }
 
