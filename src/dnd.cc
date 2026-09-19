@@ -208,7 +208,13 @@ std::vector<std::pair<UINT, std::string>> OfferedTypes(IDataObject* data) {
 
 struct DropAnswer {
   std::mutex lock;
-  std::condition_variable answered;
+  // An event rather than a condition variable, because the thread that waits
+  // on it is an STA. A single-threaded apartment that blocks without pumping
+  // deadlocks every cross-apartment call and every SendMessage aimed at it —
+  // and during a drop those are not hypothetical: the drag source is in
+  // another process, talking to this one through exactly that machinery.
+  // `CoWaitForMultipleHandles` is the wait that keeps pumping.
+  HANDLE signal = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
   // What the last DragOver was told, which is what the next one returns.
   DWORD effect = DROPEFFECT_NONE;
   // The drop is waiting for an answer to *the drop*, and the motions are
@@ -318,22 +324,31 @@ class WindowDropTarget : public IDropTarget {
       answer->waitingForDrop = true;
       answer->dropAnswered = false;
       answer->dropEffect = DROPEFFECT_NONE;
+      ::ResetEvent(answer->signal);
     }
     Report("drag-drop", at, allowed);
 
+    // The one wait in this file, and it pumps. 2 seconds is not a budget, it
+    // is a backstop: the answer is one synchronous pass through the tree and
+    // arrives in single-digit milliseconds, and what the length buys is a JS
+    // thread inside a long task still getting to answer rather than the drop
+    // silently reporting "no".
+    //
+    // COWAIT_DISPATCH_WINDOW_MESSAGES and COWAIT_DISPATCH_CALLS are what make
+    // it a legal thing to do on this thread. Without them the apartment is
+    // frozen for the whole wait: the source process's calls into it queue up
+    // behind a thread that will not answer, and so does anything else that
+    // reaches this window by message.
+    DWORD index = 0;
+    ::CoWaitForMultipleHandles(COWAIT_DISPATCH_WINDOW_MESSAGES | COWAIT_DISPATCH_CALLS,
+                               2000, 1, &answer->signal, &index);
     DWORD taken = DROPEFFECT_NONE;
     {
-      std::unique_lock<std::mutex> guard(answer->lock);
-      // The one wait in this file. 2 seconds is not a budget, it is a
-      // backstop: the answer is one synchronous pass through the tree and
-      // arrives in single-digit milliseconds, and what this length buys is a
-      // JS thread inside a long task still getting to answer rather than the
-      // drop silently reporting "no".
-      answer->answered.wait_for(guard, std::chrono::seconds(2),
-                                [&] { return answer->dropAnswered; });
+      std::lock_guard<std::mutex> guard(answer->lock);
       taken = answer->dropEffect;
       answer->waitingForDrop = false;
       answer->effect = DROPEFFECT_NONE;
+      ::ResetEvent(answer->signal);
     }
     Forget();
     *effect = taken & allowed ? (taken & allowed) : DROPEFFECT_NONE;
@@ -573,7 +588,7 @@ Napi::Value DropResponse(const Napi::CallbackInfo& info) {
       answer->dropAnswered = true;
     }
   }
-  if (forDrop) answer->answered.notify_all();
+  if (forDrop) ::SetEvent(answer->signal);
   return env.Undefined();
 }
 
