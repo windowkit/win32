@@ -600,10 +600,19 @@ bool HandleUiaMessage(int windowId, HWND hwnd, UINT message, WPARAM wparam,
   if (static_cast<long>(lparam) != static_cast<long>(UiaRootObjectId)) {
     return false;
   }
+  // A client is asking *now*, which is the one moment the JS half knows it
+  // is worth building a tree. It pushes on this, so a client that attaches to
+  // an idle application does not read whatever the mirror happened to hold
+  // from the last commit.
+  EmitEvent("uia-wanted", windowId);
+
   int64_t root = 0;
   {
     std::lock_guard<std::mutex> lock(g_uiaMutex);
     auto tree = g_trees.find(windowId);
+    // Nothing pushed yet: left to DefWindowProc, so the window is *bare*
+    // rather than half-built. The push this message just asked for lands
+    // before the client's next look.
     if (tree == g_trees.end() || !tree->second.root) return false;
     root = tree->second.root;
   }
@@ -671,10 +680,23 @@ void InitUiaExports(Napi::Env env, Napi::Object exports) {
                            update.Get("focused").As<Napi::Number>().DoubleValue())
                      : 0;
 
+        // UIA speaks screen coordinates and the tree speaks its window's
+        // client ones, so the origin is added here rather than in JS: it is
+        // one place, it is exact (`ClientToScreen` accounts for the frame,
+        // the caption and the monitor the window is on), and it saves the JS
+        // half a round trip per update to ask where its window is.
+        POINT origin = {0, 0};
+        HWND hwnd = WindowHwnd(windowId);
+        if (hwnd) ::ClientToScreen(hwnd, &origin);
+
         {
           std::lock_guard<std::mutex> lock(g_uiaMutex);
           UiaTree& tree = g_trees[windowId];
-          for (const UiaNodeData& node : parsed) tree.nodes[node.id] = node;
+          for (UiaNodeData node : parsed) {
+            node.x += origin.x;
+            node.y += origin.y;
+            tree.nodes[node.id] = node;
+          }
           for (int64_t id : removed) tree.nodes.erase(id);
           if (hasRoot) tree.root = root;
           if (hasFocus) tree.focused = focused;
