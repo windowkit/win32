@@ -127,9 +127,19 @@ std::vector<uint8_t> Bytes(const std::string& text) {
 
 // CF_HDROP is a DROPFILES followed by double-null-terminated paths. The tree
 // wants `text/uri-list`, which is CRLF-separated `file:///` URLs.
-std::string UriListOf(HDROP drop) {
+std::string UriListOf(HDROP drop, SIZE_T size) {
   std::string out;
+  // Not every application that offers CF_HDROP offers a well-formed one, and
+  // `DragQueryFile` takes the count out of the block it was handed: a block
+  // that is really a string answers with whatever those bytes happen to be,
+  // and the loop below runs that many times. Two bounds, because the cost of
+  // being wrong here is a hung drop in *this* process rather than a wrong
+  // answer: the block has to be at least a DROPFILES, and a drag of more
+  // files than could fit in it is not a drag.
+  if (size < sizeof(DROPFILES)) return out;
   const UINT count = ::DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+  const SIZE_T most = (size - sizeof(DROPFILES)) / sizeof(wchar_t);
+  if (count == 0 || count > most) return out;
   for (UINT i = 0; i < count; i++) {
     const UINT length = ::DragQueryFileW(drop, i, nullptr, 0);
     std::wstring path(length, L'\0');
@@ -170,7 +180,7 @@ std::vector<uint8_t> ReadFormat(IDataObject* data, UINT format, const std::strin
   void* locked = ::GlobalLock(medium.hGlobal);
   if (locked) {
     if (format == CF_HDROP) {
-      out = Bytes(UriListOf(static_cast<HDROP>(locked)));
+      out = Bytes(UriListOf(static_cast<HDROP>(locked), ::GlobalSize(medium.hGlobal)));
     } else if (format == CF_UNICODETEXT) {
       out = Bytes(Narrow(static_cast<const wchar_t*>(locked)));
     } else if (format == HtmlFormat()) {
@@ -192,8 +202,10 @@ std::vector<std::pair<UINT, std::string>> OfferedTypes(IDataObject* data) {
   std::vector<std::pair<UINT, std::string>> out;
   IEnumFORMATETC* formats = nullptr;
   if (FAILED(data->EnumFormatEtc(DATADIR_GET, &formats)) || !formats) return out;
+
   FORMATETC one = {};
   while (formats->Next(1, &one, nullptr) == S_OK) {
+
     if (one.tymed & TYMED_HGLOBAL) {
       const std::string mime = MimeOfFormat(one.cfFormat);
       if (!mime.empty()) out.emplace_back(one.cfFormat, mime);
@@ -202,6 +214,55 @@ std::vector<std::pair<UINT, std::string>> OfferedTypes(IDataObject* data) {
   }
   formats->Release();
   return out;
+}
+
+// A `text/uri-list` as the shell wants it: CF_HDROP.
+//
+// The two are not the same bytes and a receiver cannot tell the difference
+// until it tries. CF_HDROP is a DROPFILES header followed by the paths,
+// double-null-terminated, and a receiver reads it with `DragQueryFile` — which
+// takes the count out of the block itself. Hand it a URI-list string instead
+// and it reads a count out of `file` and loops that many times: the drop does
+// not fail, it hangs, in whichever application took it.
+std::vector<uint8_t> HdropOf(const std::string& uriList) {
+  std::vector<std::wstring> paths;
+  size_t at = 0;
+  while (at < uriList.size()) {
+    size_t end = uriList.find_first_of("\r\n", at);
+    if (end == std::string::npos) end = uriList.size();
+    const std::string line = uriList.substr(at, end - at);
+    at = end;
+    while (at < uriList.size() && (uriList[at] == '\r' || uriList[at] == '\n')) at++;
+    // `#` is a comment in a uri-list, and a blank line is nothing.
+    if (line.empty() || line[0] == '#') continue;
+    const std::wstring url = Widen(line);
+    DWORD size = MAX_PATH;
+    std::wstring path(size, L'\0');
+    if (SUCCEEDED(::PathCreateFromUrlW(url.c_str(), path.data(), &size, 0))) {
+      path.resize(size);
+      paths.push_back(path);
+    }
+    // A URL that is not a file URL has no path, and CF_HDROP has nothing to
+    // say about it. It stays in the text forms, where it is readable.
+  }
+  if (paths.empty()) return {};
+
+  size_t characters = 1;  // the extra terminator that ends the list
+  for (const std::wstring& path : paths) characters += path.size() + 1;
+  std::vector<uint8_t> block(sizeof(DROPFILES) + characters * sizeof(wchar_t), 0);
+
+  DROPFILES* header = reinterpret_cast<DROPFILES*>(block.data());
+  header->pFiles = sizeof(DROPFILES);
+  header->pt = {0, 0};
+  header->fNC = FALSE;
+  header->fWide = TRUE;
+
+  wchar_t* out = reinterpret_cast<wchar_t*>(block.data() + sizeof(DROPFILES));
+  for (const std::wstring& path : paths) {
+    memcpy(out, path.c_str(), (path.size() + 1) * sizeof(wchar_t));
+    out += path.size() + 1;
+  }
+  return block;
 }
 
 // --- the answer JS gives ----------------------------------------------------
@@ -309,6 +370,7 @@ class WindowDropTarget : public IDropTarget {
   HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD keys, POINTL at,
                                  DWORD* effect) override {
     const DWORD allowed = *effect;
+    fflush(stderr);
     // Everything, now, while the object is still alive.
     {
       std::lock_guard<std::mutex> guard(g_payloadLock);
@@ -318,6 +380,7 @@ class WindowDropTarget : public IDropTarget {
       }
     }
 
+    fflush(stderr);
     DropAnswer* answer = AnswerFor(windowId_);
     {
       std::lock_guard<std::mutex> guard(answer->lock);
@@ -327,6 +390,7 @@ class WindowDropTarget : public IDropTarget {
       ::ResetEvent(answer->signal);
     }
     Report("drag-drop", at, allowed);
+    fflush(stderr);
 
     // The one wait in this file, and it pumps. 2 seconds is not a budget, it
     // is a backstop: the answer is one synchronous pass through the tree and
@@ -342,6 +406,7 @@ class WindowDropTarget : public IDropTarget {
     DWORD index = 0;
     ::CoWaitForMultipleHandles(COWAIT_DISPATCH_WINDOW_MESSAGES | COWAIT_DISPATCH_CALLS,
                                2000, 1, &answer->signal, &index);
+    fflush(stderr);
     DWORD taken = DROPEFFECT_NONE;
     {
       std::lock_guard<std::mutex> guard(answer->lock);
@@ -628,9 +693,12 @@ Napi::Value BeginDrag(const Napi::CallbackInfo& info) {
         bytes.assign(text.begin(), text.end());
       }
       const UINT format = FormatOfMime(mime);
-      // CF_UNICODETEXT is UTF-16 with a terminator, not the UTF-8 the tree
-      // carries everywhere else.
-      if (format == CF_UNICODETEXT) {
+      if (format == CF_HDROP) {
+        bytes = HdropOf(std::string(bytes.begin(), bytes.end()));
+        if (bytes.empty()) continue;  // nothing in it the shell can carry
+      } else if (format == CF_UNICODETEXT) {
+        // CF_UNICODETEXT is UTF-16 with a terminator, not the UTF-8 the tree
+        // carries everywhere else.
         const std::wstring wide = Widen(std::string(bytes.begin(), bytes.end()));
         const uint8_t* raw = reinterpret_cast<const uint8_t*>(wide.c_str());
         bytes.assign(raw, raw + (wide.size() + 1) * sizeof(wchar_t));
