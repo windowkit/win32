@@ -911,6 +911,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitBezelExports(env, exports);
   InitGlExports(env, exports);
   InitShellExports(env, exports);
+  InitGlContextExports(env, exports);
   return exports;
 }
 

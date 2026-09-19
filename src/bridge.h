@@ -117,3 +117,4 @@ void InitDesktopExports(Napi::Env env, Napi::Object exports);
 void InitBezelExports(Napi::Env env, Napi::Object exports);
 void InitGlExports(Napi::Env env, Napi::Object exports);
 void InitShellExports(Napi::Env env, Napi::Object exports);
+void InitGlContextExports(Napi::Env env, Napi::Object exports);
