@@ -91,6 +91,88 @@ assert.deepStrictEqual(
 // The roundRect's corner must be background, or the corners are not round.
 assert.deepStrictEqual(at(21, 21), [255, 0, 0, 255], 'the roundRect has square corners');
 
+
+// --- glyph runs -------------------------------------------------------------
+//
+// The seam a grid renderer draws through: a face resolved to a handle, a cmap
+// lookup, an advance, and a pile of positioned glyphs in one call. Checked in
+// pixels, because every one of these answers a number and a wrong number
+// looks like text either way — a terminal whose columns are a fraction out
+// still reads, it just breathes.
+
+const mono = win32.fontHandle('Consolas', 16, 400, false);
+assert.ok(mono, 'no handle for Consolas at 16');
+assert.equal(
+  win32.fontHandle('Consolas', 16, 400, false),
+  mono,
+  'the same face at the same size answered two handles — drawGlyphs batches ' +
+    'by handle, so a line of text would go out one call per glyph',
+);
+
+const capA = win32.fontGlyphForCodepoint(mono, 0x41);
+assert.ok(capA, 'Consolas has no glyph for A');
+assert.equal(
+  win32.fontGlyphForCodepoint(mono, 0x4e00),
+  null,
+  'Consolas claimed a Han ideograph — .notdef is being reported as a glyph',
+);
+assert.ok(win32.fontHasGlyph(mono, 'ABC'), 'ABC is not covered');
+assert.ok(!win32.fontHasGlyph(mono, '一'), 'a Han ideograph claims coverage');
+
+// 1126/2048 of the em, which is the advance Consolas actually ships.
+const advance = win32.fontGlyphAdvances(mono, [capA])[0];
+console.log(`glyphs    : A is glyph ${capA}, advancing ${advance.toFixed(3)}px at 16`);
+assert.ok(
+  Math.abs(advance - 16 * (1126 / 2048)) < 0.01,
+  `advance ${advance} is not Consolas' 1126/2048 em`,
+);
+
+// Three A's on a 16px pitch, baseline at y=20. Their ink must start at the
+// first one and end an advance past the last: the positions are absolute, so
+// a backend that treated them as advances would stack them at the origin, and
+// one that dropped the offsets would draw all three in the same place.
+const glyphSurface = win32.createSurface(80, 30, 1);
+win32.ctxSetFillColor(glyphSurface, 0, 0, 0, 1);
+win32.ctxFillRect(glyphSurface, 0, 0, 80, 30);
+win32.ctxSetFillColor(glyphSurface, 1, 1, 1, 1);
+win32.ctxDrawGlyphs(glyphSurface, [
+  {
+    font: mono,
+    glyphs: Uint16Array.from([capA, capA, capA]),
+    positions: Float64Array.from([4, 20, 20, 20, 36, 20]),
+  },
+]);
+
+const ink = win32.ctxGetImageData(glyphSurface, 0, 0, 80, 30);
+win32.releaseSurface(glyphSurface);
+let lit = 0;
+let left = 80;
+let right = -1;
+let top = 30;
+let bottom = -1;
+for (let y = 0; y < 30; y++) {
+  for (let x = 0; x < 80; x++) {
+    if (ink[(y * 80 + x) * 4] > 100) {
+      lit++;
+      if (x < left) left = x;
+      if (x > right) right = x;
+      if (y < top) top = y;
+      if (y > bottom) bottom = y;
+    }
+  }
+}
+console.log(`glyphs    : three A's inked x ${left}..${right}, y ${top}..${bottom}`);
+assert.ok(lit > 40, 'the glyph run drew almost nothing');
+assert.ok(left >= 3 && left <= 6, `the run starts at x=${left}, not at the 4 asked for`);
+assert.ok(
+  right >= 40 && right <= 46,
+  `the run ends at x=${right} — the third A is not at the 36 asked for`,
+);
+// Above the baseline, never below it: a sign flip on the ascender offset puts
+// the whole line under the cell instead of in it.
+assert.ok(bottom <= 20, `ink reaches y=${bottom}, below the baseline at 20`);
+assert.ok(top >= 8, `ink reaches y=${top}, far above a 16px cap height`);
+
 win32.layoutRelease(layout);
 win32.layoutRelease(wrapped);
 win32.releaseSurface(surface);

@@ -864,6 +864,249 @@ Napi::Value ListFonts(const Napi::CallbackInfo& info) {
   return out;
 }
 
+// --- glyph runs -------------------------------------------------------------
+//
+// The other way to draw text, and the one a terminal needs. `layoutCreate` and
+// `drawLayout` hand DirectWrite a string and let it shape, break and position
+// it; a grid renderer has already decided where every cell goes and needs to
+// place glyphs itself, or a line of monospaced text comes back with the seams
+// between runs a fraction of a pixel out and the column grid visibly breathes.
+//
+// The shape of this is ntk's glyph-run contract, because that is what the
+// renderers are written against and what the Cocoa backend answers over
+// CoreText: a face resolved once to a handle, `glyphIdFor` to look a code
+// point up in its cmap, `advanceOf` to measure the glyph, and `ctxDrawGlyphs`
+// to put a pile of positioned glyphs down in one call.
+//
+// No shaping happens here. A cmap lookup is not shaping, and text that needs
+// ligatures, marks or a bidi pass goes through the layout path above —
+// `hasGlyphRuns` in the renderer is the gate that decides which.
+
+struct GlyphFont {
+  IDWriteFontFace* face = nullptr;
+  float size = 0;
+  // The em square the face's own numbers are in: advances come back in design
+  // units and are scaled by size/unitsPerEm to reach pixels.
+  float unitsPerEm = 1000;
+};
+
+std::map<int, GlyphFont> g_glyphFonts;
+std::map<std::wstring, int> g_glyphFontIds;
+int g_nextGlyphFont = 1;
+
+GlyphFont* GlyphFontFor(int id) {
+  auto it = g_glyphFonts.find(id);
+  return it == g_glyphFonts.end() ? nullptr : &it->second;
+}
+
+// fontHandle(family, size, weight, italic) -> int, 0 when there is no face
+//
+// Cached on everything that picks the face, because a terminal asks for the
+// same few faces on every frame and CreateFontFace is not free. The handle is
+// stable for the life of the process, which is what lets `ctxDrawGlyphs` group
+// a frame's glyphs by it.
+Napi::Value FontHandle(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!g_dwrite) return Napi::Number::New(env, 0);
+
+  const std::wstring family = ResolveFamily(Wide(info[0]));
+  const float size = static_cast<float>(info[1].As<Napi::Number>().DoubleValue());
+  const int weight = info.Length() > 2 ? info[2].As<Napi::Number>().Int32Value() : 400;
+  const bool italic = info.Length() > 3 && info[3].ToBoolean().Value();
+  if (!(size > 0)) return Napi::Number::New(env, 0);
+
+  wchar_t key[64] = {};
+  swprintf(key, 64, L"|%d|%d|%d", weight, italic ? 1 : 0,
+           static_cast<int>(size * 64));
+  const std::wstring cacheKey = family + key;
+  auto cached = g_glyphFontIds.find(cacheKey);
+  if (cached != g_glyphFontIds.end()) return Napi::Number::New(env, cached->second);
+
+  // The app's own collection first: a font the app loaded is one it chose, and
+  // a system family of the same name should not win over it.
+  IDWriteFontCollection* collection = CollectionFor(family);
+  bool ownsCollection = false;
+  if (!collection) {
+    IDWriteFontCollection* system = nullptr;
+    g_dwrite->GetSystemFontCollection(&system);
+    collection = system;
+    ownsCollection = true;
+  }
+  if (!collection) return Napi::Number::New(env, 0);
+
+  UINT32 index = 0;
+  BOOL exists = FALSE;
+  collection->FindFamilyName(family.c_str(), &index, &exists);
+  if (!exists) collection->FindFamilyName(L"Consolas", &index, &exists);
+  if (!exists) collection->FindFamilyName(L"Segoe UI", &index, &exists);
+  if (!exists) {
+    if (ownsCollection) collection->Release();
+    return Napi::Number::New(env, 0);
+  }
+
+  IDWriteFontFamily* fontFamily = nullptr;
+  collection->GetFontFamily(index, &fontFamily);
+  if (ownsCollection) collection->Release();
+  if (!fontFamily) return Napi::Number::New(env, 0);
+
+  IDWriteFont* font = nullptr;
+  fontFamily->GetFirstMatchingFont(
+      WeightOf(weight), DWRITE_FONT_STRETCH_NORMAL,
+      italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, &font);
+  fontFamily->Release();
+  if (!font) return Napi::Number::New(env, 0);
+
+  IDWriteFontFace* face = nullptr;
+  const HRESULT hr = font->CreateFontFace(&face);
+  DWRITE_FONT_METRICS metrics = {};
+  font->GetMetrics(&metrics);
+  font->Release();
+  if (FAILED(hr) || !face) return Napi::Number::New(env, 0);
+
+  const int id = g_nextGlyphFont++;
+  GlyphFont entry;
+  entry.face = face;
+  entry.size = size;
+  entry.unitsPerEm = metrics.designUnitsPerEm ? metrics.designUnitsPerEm : 1000;
+  g_glyphFonts[id] = entry;
+  g_glyphFontIds[cacheKey] = id;
+  return Napi::Number::New(env, id);
+}
+
+// fontGlyphForCodepoint(handle, codepoint) -> glyph id, or null when the face
+// does not cover it. Glyph 0 is .notdef, which is a face saying "not mine"
+// rather than a glyph a caller should draw.
+Napi::Value FontGlyphForCodepoint(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  GlyphFont* entry = GlyphFontFor(info[0].As<Napi::Number>().Int32Value());
+  if (!entry) return env.Null();
+  const UINT32 codepoint =
+      static_cast<UINT32>(info[1].As<Napi::Number>().Int32Value());
+  UINT16 glyph = 0;
+  if (FAILED(entry->face->GetGlyphIndices(&codepoint, 1, &glyph)) || glyph == 0) {
+    return env.Null();
+  }
+  return Napi::Number::New(env, glyph);
+}
+
+// fontHasGlyph(handle, text) -> is every code point in `text` covered
+Napi::Value FontHasGlyph(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  GlyphFont* entry = GlyphFontFor(info[0].As<Napi::Number>().Int32Value());
+  if (!entry) return Napi::Boolean::New(env, false);
+
+  const std::wstring text = Wide(info[1]);
+  std::vector<UINT32> codepoints;
+  for (size_t i = 0; i < text.size(); i++) {
+    UINT32 cp = text[i];
+    // A surrogate pair is one code point, and asking the cmap for half of one
+    // answers .notdef for every astral character.
+    if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < text.size() &&
+        text[i + 1] >= 0xDC00 && text[i + 1] <= 0xDFFF) {
+      cp = 0x10000 + ((cp - 0xD800) << 10) + (text[i + 1] - 0xDC00);
+      i++;
+    }
+    codepoints.push_back(cp);
+  }
+  if (codepoints.empty()) return Napi::Boolean::New(env, false);
+
+  std::vector<UINT16> glyphs(codepoints.size(), 0);
+  if (FAILED(entry->face->GetGlyphIndices(codepoints.data(),
+                                          static_cast<UINT32>(codepoints.size()),
+                                          glyphs.data()))) {
+    return Napi::Boolean::New(env, false);
+  }
+  for (UINT16 glyph : glyphs) {
+    if (glyph == 0) return Napi::Boolean::New(env, false);
+  }
+  return Napi::Boolean::New(env, true);
+}
+
+// fontGlyphAdvances(handle, ids) -> advances in pixels at the handle's size
+//
+// Design metrics, not GDI-compatible ones: these are the nominal advances the
+// caller lays its grid out on, and rounding them to whole pixels is a decision
+// for the caller rather than for this.
+Napi::Value FontGlyphAdvances(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  GlyphFont* entry = GlyphFontFor(info[0].As<Napi::Number>().Int32Value());
+  if (!entry) return env.Null();
+  Napi::Array ids = info[1].As<Napi::Array>();
+  const uint32_t count = ids.Length();
+
+  Napi::Float64Array out = Napi::Float64Array::New(env, count);
+  if (count == 0) return out;
+
+  std::vector<UINT16> glyphs(count, 0);
+  for (uint32_t i = 0; i < count; i++) {
+    glyphs[i] = static_cast<UINT16>(ids.Get(i).As<Napi::Number>().Int32Value());
+  }
+  std::vector<DWRITE_GLYPH_METRICS> metrics(count);
+  if (FAILED(entry->face->GetDesignGlyphMetrics(glyphs.data(), count,
+                                                metrics.data(), FALSE))) {
+    return out;
+  }
+  const double scale = entry->size / entry->unitsPerEm;
+  for (uint32_t i = 0; i < count; i++) {
+    out[i] = metrics[i].advanceWidth * scale;
+  }
+  return out;
+}
+
+// ctxDrawGlyphs(surface, [{ font, glyphs, positions }])
+//
+// `positions` is x,y pairs, one per glyph, absolute in user space — the shape
+// BackendContext2D builds out of ntk's pen contract. DirectWrite places a run
+// from one baseline origin plus per-glyph advances, so the run goes out with
+// every advance zero and each glyph's place carried as its offset: the advance
+// offset is x, and the ascender offset is -y because it points up while the
+// coordinate space points down.
+Napi::Value CtxDrawGlyphs(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Surface* surface = SurfaceFor(info[0].As<Napi::Number>().Int32Value());
+  if (!surface || !surface->dc || !info[1].IsArray()) return env.Undefined();
+
+  ID2D1SolidColorBrush* brush = MakeBrush(surface, surface->state.fill);
+  if (!brush) return env.Undefined();
+
+  Napi::Array runs = info[1].As<Napi::Array>();
+  for (uint32_t r = 0; r < runs.Length(); r++) {
+    Napi::Value value = runs.Get(r);
+    if (!value.IsObject()) continue;
+    Napi::Object run = value.As<Napi::Object>();
+    GlyphFont* entry =
+        GlyphFontFor(run.Get("font").As<Napi::Number>().Int32Value());
+    if (!entry) continue;
+
+    Napi::Uint16Array ids = run.Get("glyphs").As<Napi::Uint16Array>();
+    Napi::Float64Array positions = run.Get("positions").As<Napi::Float64Array>();
+    const UINT32 count = static_cast<UINT32>(ids.ElementLength());
+    if (count == 0 || positions.ElementLength() < count * 2) continue;
+
+    std::vector<FLOAT> advances(count, 0.0f);
+    std::vector<DWRITE_GLYPH_OFFSET> offsets(count);
+    for (UINT32 i = 0; i < count; i++) {
+      offsets[i].advanceOffset = static_cast<FLOAT>(positions[i * 2]);
+      offsets[i].ascenderOffset = static_cast<FLOAT>(-positions[i * 2 + 1]);
+    }
+
+    DWRITE_GLYPH_RUN glyphRun = {};
+    glyphRun.fontFace = entry->face;
+    glyphRun.fontEmSize = entry->size;
+    glyphRun.glyphCount = count;
+    glyphRun.glyphIndices = ids.Data();
+    glyphRun.glyphAdvances = advances.data();
+    glyphRun.glyphOffsets = offsets.data();
+    glyphRun.isSideways = FALSE;
+    glyphRun.bidiLevel = 0;
+
+    surface->dc->DrawGlyphRun(D2D1::Point2F(0, 0), &glyphRun, brush,
+                              DWRITE_MEASURING_MODE_NATURAL);
+  }
+  brush->Release();
+  return env.Undefined();
+}
+
 }  // namespace
 
 void InitTextExports(Napi::Env env, Napi::Object exports) {
@@ -883,4 +1126,10 @@ void InitTextExports(Napi::Env env, Napi::Object exports) {
   set("fontExists", FontExists);
   set("listFonts", ListFonts);
   set("fontLoad", FontLoad);
+  set("fontHandle", FontHandle);
+  set("fontGlyphForCodepoint", FontGlyphForCodepoint);
+  set("fontHasGlyph", FontHasGlyph);
+  set("fontGlyphAdvances", FontGlyphAdvances);
+  // BackendContext2D's name again, like drawLayout above.
+  set("ctxDrawGlyphs", CtxDrawGlyphs);
 }
