@@ -133,4 +133,12 @@ void InitDndExports(Napi::Env env, Napi::Object exports);
 // The taskbar's own messages — the button appearing, and a thumbnail
 // toolbar button being clicked. True when it was one of them.
 bool HandleTaskbarMessage(int windowId, UINT message, WPARAM wparam);
+
+// The input method's messages. True when it was one of them, and `result` is
+// then what the window procedure must answer: IMM32 cares about the value,
+// because returning DefWindowProc's opens the composition window this backend
+// exists to replace.
+bool HandleImeMessage(int windowId, HWND hwnd, UINT message, WPARAM wparam,
+                      LPARAM lparam, LRESULT* result);
+void InitImeExports(Napi::Env env, Napi::Object exports);
 void InitGlContextExports(Napi::Env env, Napi::Object exports);

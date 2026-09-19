@@ -383,13 +383,43 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
     }
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+      // VK_PROCESSKEY is the input method saying "this press was mine". It
+      // has to be forwarded, because DefWindowProc is what turns it into the
+      // WM_IME_* messages below — and it must *not* be decoded, or every
+      // keystroke of a Japanese composition would also type its Latin letter
+      // into the field.
+      if (wparam == VK_PROCESSKEY) {
+        return ::DefWindowProcW(hwnd, message, wparam, lparam);
+      }
       // WM_SYSKEY* is the same press with Alt held. Falling through means an
       // Alt chord reaches the app instead of only the system menu.
       EmitKey(window, "keydown", wparam, lparam);
       return 0;
     case WM_KEYUP:
     case WM_SYSKEYUP:
+      if (wparam == VK_PROCESSKEY) {
+        return ::DefWindowProcW(hwnd, message, wparam, lparam);
+      }
       EmitKey(window, "keyup", wparam, lparam);
+      return 0;
+    // The input method, which src/ime.cc owns. The value each one answers
+    // with is load-bearing rather than incidental — DefWindowProc's answer
+    // opens the system composition window over the field that is already
+    // drawing the preedit — so the handler chooses it and this passes it on.
+    case WM_IME_SETCONTEXT:
+    case WM_IME_STARTCOMPOSITION:
+    case WM_IME_COMPOSITION:
+    case WM_IME_ENDCOMPOSITION: {
+      LRESULT answer = 0;
+      if (HandleImeMessage(window->id, hwnd, message, wparam, lparam, &answer)) {
+        return answer;
+      }
+      return ::DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    // The committed text arrives twice: once as GCS_RESULTSTR, which
+    // src/ime.cc reads, and again as characters here. Swallowed, or every
+    // composition would be inserted twice over.
+    case WM_IME_CHAR:
       return 0;
     case WM_ACTIVATE:
       // The window the keyboard is talking to. WM_ACTIVATE rather than
@@ -1340,6 +1370,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitGlExports(env, exports);
   InitShellExports(env, exports);
   InitDndExports(env, exports);
+  InitImeExports(env, exports);
   InitGlContextExports(env, exports);
   return exports;
 }
