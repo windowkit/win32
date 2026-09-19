@@ -917,6 +917,23 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 
 }  // namespace
 
+// --- what the GL surfaces need from here -----------------------------------
+//
+// A `<glarea>` is composited as a visual of its own inside the window's tree,
+// stacked over the 2D content the way a child window is stacked over its
+// parent on X11. It cannot be an actual child HWND: a window that presents
+// through DirectComposition has no redirection bitmap in play, so a child's
+// pixels are composited nowhere and a transparent hole in the 2D layer shows
+// the desktop rather than the child. So src/glcontext.cc builds a swap chain,
+// and needs the device it must share with and the visual to hang it under.
+
+ID3D11Device* BridgeD3DDevice() { return g_d3d; }
+
+IDCompositionVisual2* WindowVisual(int windowId) {
+  Window* window = LookupWindow(windowId);
+  return window ? window->visual : nullptr;
+}
+
 // The seam the other translation units reach the thread split through. Defined
 // here because the queue and the event channel are this file's; declared in
 // bridge.h so shell.cc and its siblings need nothing else.

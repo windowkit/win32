@@ -49,13 +49,15 @@ async function main() {
   win32.compose(wnd);
   win32.show(wnd, true);
 
-  const surface = win32.glCreateSurface(win32.windowHandle(wnd), 0, 0, 320, 240);
+  const surface = win32.glCreateSurface(wnd, 0, 0, 320, 240);
   assert.ok(surface > 0, 'glCreateSurface answered no id');
   const ready = await waitFor('gl-ready');
   assert.equal(ready.a, 1, 'the GL surface was refused');
   console.log('surface   : created on the UI thread, context made here');
 
-  assert.ok(win32.glMakeCurrent(surface), 'could not make the context current');
+  if (!win32.glMakeCurrent(surface)) {
+    throw new Error(`could not make the context current: ${win32.glInterop().failure}`);
+  }
   const gl = win32.glTable();
 
   // --- a clear, read back -----------------------------------------------------

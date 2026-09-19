@@ -17,6 +17,8 @@
 #include <dwrite_3.h>
 #include <dcomp.h>
 #include <dwmapi.h>
+#include <d3d11.h>
+#include <dxgi1_3.h>
 
 #include <functional>
 #include <map>
@@ -111,6 +113,12 @@ void PostToUiThread(std::function<void()> command);
 void EmitEvent(const char* type, int id, double a = 0, double b = 0, double c = 0,
                double d = 0, const std::u16string& text = std::u16string());
 
+
+// The Direct3D device every surface shares, and a window's root visual — what
+// a GL surface needs to put its swap chain in the window's composition tree.
+// See the note above their definitions in src/win32.cc.
+ID3D11Device* BridgeD3DDevice();
+IDCompositionVisual2* WindowVisual(int windowId);
 void InitSurfaceExports(Napi::Env env, Napi::Object exports);
 void InitTextExports(Napi::Env env, Napi::Object exports);
 void InitDesktopExports(Napi::Env env, Napi::Object exports);
