@@ -150,6 +150,92 @@ void DrainCommands() {
 // The UI thread
 // ---------------------------------------------------------------------------
 
+// --- the keyboard ----------------------------------------------------------
+//
+// A key press is three facts, not one: which key it was, what it typed, and
+// what it would have typed with nothing held down. The renderer reads all
+// three — the last is what a chord like Ctrl+S matches against, so that it
+// still matches when Shift is down too.
+//
+// Windows delivers them apart: WM_KEYDOWN carries the virtual key, and the
+// character arrives later as WM_CHAR, after TranslateMessage has run. Waiting
+// for it would split one press into two events and lose the pairing for a key
+// that types nothing. So the character is decoded here instead, with
+// ToUnicodeEx — the same function TranslateMessage uses — against a copy of
+// the keyboard state.
+//
+// The `0x4` flag is load-bearing: without it ToUnicodeEx *consumes* a pending
+// dead key, so decoding a press would eat the accent the next press was
+// supposed to combine with. It says "do not change the keyboard state", and
+// is why this can ask twice.
+
+constexpr uint32_t kModShift = 1;
+constexpr uint32_t kModControl = 2;
+constexpr uint32_t kModAlt = 4;
+constexpr uint32_t kModSuper = 8;
+constexpr uint32_t kModLock = 16;
+
+uint32_t ModifierMask() {
+  uint32_t mask = 0;
+  if (::GetKeyState(VK_SHIFT) < 0) mask |= kModShift;
+  if (::GetKeyState(VK_CONTROL) < 0) mask |= kModControl;
+  if (::GetKeyState(VK_MENU) < 0) mask |= kModAlt;
+  if (::GetKeyState(VK_LWIN) < 0 || ::GetKeyState(VK_RWIN) < 0) mask |= kModSuper;
+  if (::GetKeyState(VK_CAPITAL) & 1) mask |= kModLock;
+  return mask;
+}
+
+// The code point `state` would type for this key, or 0 for a key that types
+// nothing (an arrow, a function key) and for a dead key still waiting for the
+// letter it belongs to.
+uint32_t CodepointFor(UINT vk, UINT scan, const BYTE* state, HKL layout) {
+  wchar_t buffer[8] = {};
+  const int written =
+      ::ToUnicodeEx(vk, scan, state, buffer, 8, 0x4 /* keep dead keys */, layout);
+  if (written <= 0) return 0;
+  const wchar_t first = buffer[0];
+  // A surrogate pair is one code point; a layout that types one is rare but
+  // reporting half of it would be worse than reporting none.
+  if (first >= 0xD800 && first <= 0xDBFF && written >= 2) {
+    const wchar_t low = buffer[1];
+    if (low >= 0xDC00 && low <= 0xDFFF) {
+      return 0x10000 + ((first - 0xD800) << 10) + (low - 0xDC00);
+    }
+    return 0;
+  }
+  // Control characters are what Ctrl+letter types, and the renderer wants the
+  // letter. They are filtered out here rather than there because only this
+  // side knows they came from a modifier rather than from the key.
+  if (first < 0x20 || first == 0x7f) return 0;
+  return static_cast<uint32_t>(first);
+}
+
+void EmitKey(Window* window, const char* type, WPARAM wparam, LPARAM lparam) {
+  const UINT vk = static_cast<UINT>(wparam);
+  const UINT scan = (static_cast<UINT>(lparam) >> 16) & 0xFF;
+  const HKL layout = ::GetKeyboardLayout(0);
+
+  BYTE state[256] = {};
+  ::GetKeyboardState(state);
+
+  // What it typed. Control and Alt are cleared first: Ctrl+A types U+0001,
+  // and what the renderer needs to hear is "A".
+  BYTE typed[256];
+  memcpy(typed, state, sizeof(typed));
+  typed[VK_CONTROL] = typed[VK_LCONTROL] = typed[VK_RCONTROL] = 0;
+  typed[VK_MENU] = typed[VK_LMENU] = typed[VK_RMENU] = 0;
+  const uint32_t codepoint = CodepointFor(vk, scan, typed, layout);
+
+  // What it would type with nothing held — including Shift and CapsLock, so
+  // a chord matches the same key however it is being pressed.
+  BYTE base[256] = {};
+  const uint32_t baseCodepoint = CodepointFor(vk, scan, base, layout);
+
+  Emit(Event{type, window->id, static_cast<double>(vk),
+             static_cast<double>(codepoint), static_cast<double>(baseCodepoint),
+             static_cast<double>(ModifierMask())});
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
   Window* window = reinterpret_cast<Window*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
   if (!window) return ::DefWindowProcW(hwnd, message, wparam, lparam);
@@ -213,7 +299,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
                  static_cast<double>(GET_Y_LPARAM(lparam))});
       return 0;
     case WM_KEYDOWN:
-      Emit(Event{"keydown", window->id, static_cast<double>(wparam)});
+    case WM_SYSKEYDOWN:
+      // WM_SYSKEY* is the same press with Alt held. Falling through means an
+      // Alt chord reaches the app instead of only the system menu.
+      EmitKey(window, "keydown", wparam, lparam);
+      return 0;
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+      EmitKey(window, "keyup", wparam, lparam);
       return 0;
     case WM_CLOSE:
       // A close request is the app's to answer, never the platform's: emit it
