@@ -1,0 +1,137 @@
+# Cut a release, build the binaries for it, publish the package.
+#
+# release-please keeps a pull request open that holds the next version and the
+# changelog entry for everything merged since the last release. Merging that
+# pull request is the release: it tags, it creates the GitHub release, and the
+# jobs below fill that release with binaries and push the package.
+#
+# The binaries are the point. This is a native addon, and a consumer who has to
+# build it needs Visual Studio with the C++ workload and a Windows SDK — so a
+# published package without prebuilds is one that installs for the people who
+# already have a compiler. Both architectures are built on their own runner and
+# assembled into one tarball, because npm resolves a package per platform and
+# not per architecture: `prebuilds/win32-x64/` and `prebuilds/win32-arm64/` both
+# ship, and `scripts/install.js` picks the one that matches at install time.
+name: release-please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      released: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # One job per architecture, each on a runner of that architecture. Nothing
+  # here cross-compiles: an ARM64 binary built by an x64 toolchain is a thing
+  # MSVC can make, but it is not a thing this project can test, and a prebuild
+  # that was never run is a prebuild that fails on the machine it was for.
+  prebuild:
+    needs: release-please
+    if: needs.release-please.outputs.released == 'true'
+    name: prebuild ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run build:prebuild
+      - name: Arch check
+        run: node scripts/check-arch.js
+      # Proof the binary runs at all on the architecture it was built for,
+      # before it is published as the one that spares people a compiler.
+      - name: Smoke test
+        run: npm run test:unit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-win32-${{ matrix.arch }}
+          path: prebuilds/win32-${{ matrix.arch }}/win32.node
+          if-no-files-found: error
+
+  publish:
+    needs: [release-please, prebuild]
+    if: needs.release-please.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to attach the binaries to the release
+      id-token: write # npm trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs a recent npm; the one bundled with Node 22 is
+      # older than the version that learned it.
+      - run: npm install -g npm@latest
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: prebuild-win32-*
+          path: artifacts
+
+      # The artifacts come back one folder per name; `prebuilds/` is the layout
+      # index.js looks in, and `files` in package.json is what ships it.
+      - name: Assemble prebuilds
+        run: |
+          set -euo pipefail
+          for arch in x64 arm64; do
+            mkdir -p "prebuilds/win32-$arch"
+            cp "artifacts/prebuild-win32-$arch/win32.node" "prebuilds/win32-$arch/win32.node"
+          done
+          ls -l prebuilds/*/win32.node
+
+      # No dependencies to install and nothing to build here: the tarball is
+      # the checked-out source plus the binaries above. `npm ci` would run the
+      # install script, which on Linux does nothing but is noise.
+      - name: Pack
+        run: npm pack
+
+      - name: Attach the binaries to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cp prebuilds/win32-x64/win32.node win32-x64.node
+          cp prebuilds/win32-arm64/win32.node win32-arm64.node
+          gh release upload "${{ needs.release-please.outputs.tag }}" \
+            win32-x64.node win32-arm64.node *.tgz --clobber
+
+      # Trusted publishing: npm takes the OIDC token from the job above and
+      # needs no NPM_TOKEN. It has to be configured on the package first, and
+      # a package has to exist to be configured — which is why the first
+      # release of this package is published by hand. docs/releasing.md.
+      - name: Publish
+        run: npm publish --provenance --access public

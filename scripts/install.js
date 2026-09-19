@@ -7,12 +7,22 @@
 // message can say what to do about it.
 
 const { existsSync } = require('node:fs');
-const { join } = require('node:path');
+const { join, delimiter } = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 if (process.platform !== 'win32') {
   console.log('@windowkit/win32: not Windows, nothing to build.');
   process.exit(0);
+}
+
+// node-gyp is a devDependency here and a bundled part of npm for a consumer,
+// and neither is on PATH unless npm put it there — which it does for a
+// lifecycle script and for `npm run`, and not for `node scripts/thisfile.js`.
+// Prepending the local .bin makes both spellings work and pins the version CI
+// builds with.
+function gypEnv(root) {
+  const bin = join(root, 'node_modules', '.bin');
+  return { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH ?? ''}` };
 }
 
 const prebuild = join(
@@ -27,7 +37,11 @@ if (existsSync(prebuild)) {
   process.exit(0);
 }
 
-const result = spawnSync('node-gyp', ['rebuild'], { stdio: 'inherit', shell: true });
+const result = spawnSync('node-gyp rebuild', {
+  stdio: 'inherit',
+  shell: true,
+  env: gypEnv(join(__dirname, '..')),
+});
 if (result.status !== 0) {
   console.warn(
     '@windowkit/win32: no prebuild for this architecture and the source build failed. ' +

@@ -1,0 +1,121 @@
+# Build and test the bridge on both architectures it ships for.
+#
+# The suite is split by what each part of it needs from the machine, because a
+# GitHub runner is not a desktop: it has no GPU vendor driver, and its session
+# is not one a person is sitting at. Splitting it here is what lets the parts
+# that can be trusted on a runner *fail the build*, instead of the whole suite
+# being advisory because one third of it cannot run.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.arch }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+            node: 20
+          - arch: x64
+            runner: windows-latest
+            node: 22
+          - arch: x64
+            runner: windows-latest
+            node: 24
+          # GitHub's Windows ARM64 runner. Newer than the x64 one and not on
+          # every plan; `continue-on-error` below keeps a missing runner from
+          # failing the branch while the x64 legs still gate it.
+          - arch: arm64
+            runner: windows-11-arm
+            node: 22
+          - arch: arm64
+            runner: windows-11-arm
+            node: 24
+    continue-on-error: ${{ matrix.arch == 'arm64' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # `npm ci` runs the install script, which builds from source when there
+      # is no prebuild — so this compiles the addon as a consumer would.
+      - run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Arch check
+        shell: pwsh
+        run: node scripts/check-arch.js
+
+      # Direct2D, DirectWrite and the theme engine, none of which need a window
+      # on screen or a graphics driver. These gate the build.
+      - name: Test (no window, no GPU)
+        run: npm run test:unit
+
+      # A real HWND, composed by DWM and read back with PrintWindow. This does
+      # work on a GitHub runner, but it depends on the session having a desktop
+      # to compose into, which is a property of the runner image rather than of
+      # this code — so it reports without gating.
+      - name: Test (windows on screen)
+        continue-on-error: true
+        run: npm run test:window
+
+      # A tray icon, a taskbar button, a global hotkey and a Common Item
+      # Dialog: the shell, which a runner has only part of.
+      - name: Test (shell integration)
+        continue-on-error: true
+        run: npm run test:shell
+
+      # A vendor OpenGL driver, which no hosted runner has — the WGL a runner
+      # offers is the 1.1 software rasterizer, and this test asks for a core
+      # context on purpose. Run for the record, never gating.
+      - name: Test (GPU)
+        continue-on-error: true
+        run: npm run test:gpu
+
+  # The binary that would ship, built the way the release builds it, so a
+  # packaging break is caught on the pull request rather than on the tag.
+  prebuild:
+    name: prebuild ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    continue-on-error: ${{ matrix.arch == 'arm64' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run build:prebuild
+      - run: node scripts/check-arch.js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-win32-${{ matrix.arch }}
+          path: prebuilds/win32-${{ matrix.arch }}/win32.node
+          if-no-files-found: error
+          retention-days: 7
