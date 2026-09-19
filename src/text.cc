@@ -234,6 +234,81 @@ Napi::Value FontLoad(const Napi::CallbackInfo& info) {
 
 // --- exports ---------------------------------------------------------------
 
+// The typographic ascent and descent of a line, from the faces actually on
+// it rather than from the line box.
+//
+// DWRITE_LINE_METRICS gives `height` and `baseline`, and a caller that wants
+// the *leading* — the room the line box has over the glyphs — needs the third
+// number: height minus ascent minus descent. Taking ascent from `baseline`
+// makes that difference zero by construction, which is not a measurement.
+//
+// So ask the faces. A line may mix them, and the line box is sized by the
+// tallest, so the maxima are what the line is actually built from.
+struct LineExtents {
+  float ascent = 0;
+  float descent = 0;
+};
+
+LineExtents ExtentsOf(IDWriteTextLayout* layout, UINT32 start, UINT32 end) {
+  LineExtents out;
+  UINT32 position = start;
+  while (position < end) {
+    DWRITE_TEXT_RANGE range = {position, 1};
+    UINT32 nameLength = 0;
+    if (FAILED(layout->GetFontFamilyNameLength(position, &nameLength, &range))) break;
+    std::wstring family(nameLength + 1, L'\0');
+    layout->GetFontFamilyName(position, family.data(), nameLength + 1, &range);
+    family.resize(nameLength);
+
+    float size = 0;
+    layout->GetFontSize(position, &size, nullptr);
+    DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
+    layout->GetFontWeight(position, &weight, nullptr);
+    DWRITE_FONT_STYLE style = DWRITE_FONT_STYLE_NORMAL;
+    layout->GetFontStyle(position, &style, nullptr);
+    DWRITE_FONT_STRETCH stretch = DWRITE_FONT_STRETCH_NORMAL;
+    layout->GetFontStretch(position, &stretch, nullptr);
+
+    IDWriteFontCollection* collection = CollectionFor(family);
+    IDWriteFontCollection* owned = nullptr;
+    if (!collection) {
+      g_dwrite->GetSystemFontCollection(&owned);
+      collection = owned;
+    }
+    if (collection) {
+      UINT32 index = 0;
+      BOOL exists = FALSE;
+      if (SUCCEEDED(collection->FindFamilyName(family.c_str(), &index, &exists)) &&
+          exists) {
+        IDWriteFontFamily* fontFamily = nullptr;
+        if (SUCCEEDED(collection->GetFontFamily(index, &fontFamily)) && fontFamily) {
+          IDWriteFont* font = nullptr;
+          if (SUCCEEDED(fontFamily->GetFirstMatchingFont(weight, stretch, style,
+                                                         &font)) &&
+              font) {
+            DWRITE_FONT_METRICS fm = {};
+            font->GetMetrics(&fm);
+            if (fm.designUnitsPerEm > 0) {
+              const float scale = size / fm.designUnitsPerEm;
+              out.ascent = (std::max)(out.ascent, fm.ascent * scale);
+              out.descent = (std::max)(out.descent, fm.descent * scale);
+            }
+            font->Release();
+          }
+          fontFamily->Release();
+        }
+      }
+    }
+    if (owned) owned->Release();
+
+    // Skip to the end of the run this position belongs to; the range the
+    // getters filled in says how far the same formatting reaches.
+    const UINT32 next = range.startPosition + (std::max)(1u, range.length);
+    position = next > position ? next : position + 1;
+  }
+  return out;
+}
+
 // layoutCreate(text, { family, size, weight, italic, maxWidth, align,
 //                      lineHeight, maxLines, rtl }, spans) -> id
 //
@@ -408,6 +483,9 @@ Napi::Value LayoutMetrics(const Napi::CallbackInfo& info) {
     line.Set("y", Napi::Number::New(env, y));
     line.Set("height", Napi::Number::New(env, lines[i].height));
     line.Set("baseline", Napi::Number::New(env, lines[i].baseline));
+    const LineExtents extents = ExtentsOf(entry->layout, start, end);
+    line.Set("ascent", Napi::Number::New(env, extents.ascent));
+    line.Set("descent", Napi::Number::New(env, extents.descent));
 
     // The line's **runs**: one per direction and style change, which is what
     // a selection highlight is built out of. A range is contiguous in logical
@@ -646,34 +724,143 @@ Napi::Value FontExists(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(env, exists == TRUE);
 }
 
+// The path a face was loaded from, where it came from a file at all. A font
+// supplied as bytes has no path and the catalogue leaves it out, which is the
+// same answer fontconfig gives for a memory face.
+std::wstring FilePathOf(IDWriteFont* font) {
+  IDWriteFontFace* face = nullptr;
+  if (FAILED(font->CreateFontFace(&face)) || !face) return L"";
+  std::wstring path;
+  UINT32 fileCount = 0;
+  if (SUCCEEDED(face->GetFiles(&fileCount, nullptr)) && fileCount > 0) {
+    std::vector<IDWriteFontFile*> files(fileCount, nullptr);
+    if (SUCCEEDED(face->GetFiles(&fileCount, files.data()))) {
+      const void* key = nullptr;
+      UINT32 keySize = 0;
+      IDWriteFontFileLoader* loader = nullptr;
+      if (files[0] && SUCCEEDED(files[0]->GetReferenceKey(&key, &keySize)) &&
+          SUCCEEDED(files[0]->GetLoader(&loader)) && loader) {
+        IDWriteLocalFontFileLoader* local = nullptr;
+        if (SUCCEEDED(loader->QueryInterface(__uuidof(IDWriteLocalFontFileLoader),
+                                             reinterpret_cast<void**>(&local)))) {
+          UINT32 length = 0;
+          if (SUCCEEDED(local->GetFilePathLengthFromKey(key, keySize, &length))) {
+            path.resize(length + 1);
+            if (SUCCEEDED(local->GetFilePathFromKey(key, keySize, path.data(),
+                                                    length + 1))) {
+              path.resize(length);
+            } else {
+              path.clear();
+            }
+          }
+          local->Release();
+        }
+        loader->Release();
+      }
+      for (IDWriteFontFile* file : files) {
+        if (file) file->Release();
+      }
+    }
+  }
+  face->Release();
+  return path;
+}
+
+std::wstring FirstString(IDWriteLocalizedStrings* strings) {
+  if (!strings || strings->GetCount() == 0) return L"";
+  UINT32 length = 0;
+  strings->GetStringLength(0, &length);
+  std::wstring out(length + 1, L'\0');
+  strings->GetString(0, out.data(), length + 1);
+  out.resize(length);
+  return out;
+}
+
+Napi::String Wrap(Napi::Env env, const std::wstring& text) {
+  return Napi::String::New(env, reinterpret_cast<const char16_t*>(text.c_str()));
+}
+
+// listFonts({ family, limit }) -> [{ path, postscriptName, family, style,
+//                                    weight, italic }]
+//
+// The catalogue seam: one row per *face*, not per family, because that is
+// what a font browser lists and what `fonts.source.matchSortedAsync` answers
+// with. Fonts the app loaded come first — they are the ones it meant.
 Napi::Value ListFonts(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   Napi::Array out = Napi::Array::New(env);
   if (!g_dwrite) return out;
 
-  IDWriteFontCollection* collection = nullptr;
-  g_dwrite->GetSystemFontCollection(&collection);
-  if (!collection) return out;
-
-  const UINT32 count = collection->GetFontFamilyCount();
-  uint32_t at = 0;
-  for (UINT32 i = 0; i < count; i++) {
-    IDWriteFontFamily* family = nullptr;
-    if (FAILED(collection->GetFontFamily(i, &family)) || !family) continue;
-    IDWriteLocalizedStrings* names = nullptr;
-    if (SUCCEEDED(family->GetFamilyNames(&names)) && names) {
-      UINT32 length = 0;
-      names->GetStringLength(0, &length);
-      std::wstring name(length + 1, L'\0');
-      names->GetString(0, name.data(), length + 1);
-      name.resize(length);
-      out.Set(at++, Napi::String::New(
-                        env, reinterpret_cast<const char16_t*>(name.c_str())));
-      names->Release();
-    }
-    family->Release();
+  Napi::Object options =
+      info.Length() > 0 && info[0].IsObject() ? info[0].As<Napi::Object>() : Napi::Object::New(env);
+  std::wstring wanted;
+  if (options.Has("family") && options.Get("family").IsString()) {
+    wanted = Wide(options.Get("family"));
   }
-  collection->Release();
+  uint32_t limit = 400;
+  if (options.Has("limit") && options.Get("limit").IsNumber()) {
+    limit = options.Get("limit").As<Napi::Number>().Uint32Value();
+  }
+
+  uint32_t at = 0;
+  const auto walk = [&](IDWriteFontCollection* collection) {
+    if (!collection) return;
+    const UINT32 count = collection->GetFontFamilyCount();
+    for (UINT32 i = 0; i < count && at < limit; i++) {
+      IDWriteFontFamily* family = nullptr;
+      if (FAILED(collection->GetFontFamily(i, &family)) || !family) continue;
+      IDWriteLocalizedStrings* names = nullptr;
+      std::wstring familyName;
+      if (SUCCEEDED(family->GetFamilyNames(&names))) {
+        familyName = FirstString(names);
+        if (names) names->Release();
+      }
+      // A family filter matches the whole name, case-insensitively: this is
+      // a catalogue lookup, not a search.
+      if (!wanted.empty() && _wcsicmp(familyName.c_str(), wanted.c_str()) != 0) {
+        family->Release();
+        continue;
+      }
+      const UINT32 faces = family->GetFontCount();
+      for (UINT32 f = 0; f < faces && at < limit; f++) {
+        IDWriteFont* font = nullptr;
+        if (FAILED(family->GetFont(f, &font)) || !font) continue;
+        IDWriteLocalizedStrings* faceNames = nullptr;
+        std::wstring style;
+        if (SUCCEEDED(font->GetFaceNames(&faceNames))) {
+          style = FirstString(faceNames);
+          if (faceNames) faceNames->Release();
+        }
+        std::wstring postscript;
+        IDWriteLocalizedStrings* psNames = nullptr;
+        BOOL exists = FALSE;
+        if (SUCCEEDED(font->GetInformationalStrings(
+                DWRITE_INFORMATIONAL_STRING_POSTSCRIPT_NAME, &psNames, &exists)) &&
+            exists) {
+          postscript = FirstString(psNames);
+        }
+        if (psNames) psNames->Release();
+
+        Napi::Object row = Napi::Object::New(env);
+        row.Set("family", Wrap(env, familyName));
+        row.Set("style", Wrap(env, style));
+        row.Set("postscriptName", Wrap(env, postscript));
+        row.Set("path", Wrap(env, FilePathOf(font)));
+        row.Set("weight", Napi::Number::New(env, static_cast<int>(font->GetWeight())));
+        row.Set("italic",
+                Napi::Boolean::New(env, font->GetStyle() != DWRITE_FONT_STYLE_NORMAL));
+        out.Set(at++, row);
+        font->Release();
+      }
+      family->Release();
+    }
+  };
+
+  walk(g_loaded);
+  IDWriteFontCollection* system = nullptr;
+  g_dwrite->GetSystemFontCollection(&system);
+  walk(system);
+  if (system) system->Release();
   return out;
 }
 
