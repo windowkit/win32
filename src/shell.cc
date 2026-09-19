@@ -274,6 +274,135 @@ Napi::Value TrayRemove(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+// --- notifications ----------------------------------------------------------
+//
+// A balloon on a tray icon, which Windows 10 and 11 show as a toast in the
+// action centre like any other.
+//
+// This is the floor rather than the rung anyone would choose: the real API is
+// the Windows App SDK's notification manager, and toasts from it carry
+// buttons, inline replies, images and a lifetime the app controls. What it
+// wants first is an AppUserModelID the system knows — a Start-menu shortcut
+// carrying one, or a registry registration — and an unpackaged app has to put
+// that there itself. Until packaging (docs/windows.md §"Packaging and
+// identity") that is a different feature, and a balloon is what can be shown
+// today without asking the user to install anything.
+//
+// What it costs: no actions, no replace-in-place, and an icon in the
+// notification area for as long as the notifier exists. An app that already
+// has a tray icon passes its id and pays nothing extra.
+
+int g_notifier = 0;
+
+// The tray item notifications go out on: the app's own if it named one, or a
+// quiet one of ours, made once and kept. A balloon has to belong to an icon —
+// Shell_NotifyIcon has no other way to say it.
+TrayItem* NotifierItem() {
+  if (g_notifier) {
+    auto it = g_tray.find(g_notifier);
+    if (it != g_tray.end()) return it->second;
+  }
+  TrayItem* item = new TrayItem();
+  item->id = g_nextTrayId++;
+  g_tray[item->id] = item;
+  g_notifier = item->id;
+  item->hwnd = MakeTrayWindow();
+  if (!item->hwnd) return item;
+  item->icon = ::LoadIconW(nullptr, IDI_APPLICATION);
+
+  NOTIFYICONDATAW data = {sizeof(data)};
+  data.hWnd = item->hwnd;
+  data.uID = 1;
+  data.uFlags = NIF_ICON | NIF_MESSAGE;
+  data.uCallbackMessage = WM_TRAY_CALLBACK;
+  data.hIcon = item->icon;
+  ::Shell_NotifyIconW(NIM_ADD, &data);
+  return item;
+}
+
+// trayNotify(trayId, { title, body, urgency }) -> true when it went out
+//
+// `trayId` of 0 means "whatever icon you have"; a real id posts the balloon on
+// that icon, which is what an app with a tray icon of its own wants — the
+// balloon points at the icon it came from.
+Napi::Value TrayNotify(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const int wanted = info[0].As<Napi::Number>().Int32Value();
+  Napi::Object options = info[1].As<Napi::Object>();
+
+  const std::wstring title = Given(options, "title") ? Wide(options.Get("title")) : L"";
+  const std::wstring body = Given(options, "body") ? Wide(options.Get("body")) : L"";
+  const std::string urgency =
+      Given(options, "urgency") ? options.Get("urgency").As<Napi::String>().Utf8Value()
+                                : "normal";
+
+  PostToUiThread([wanted, title, body, urgency]() {
+    TrayItem* item = nullptr;
+    if (wanted) {
+      auto it = g_tray.find(wanted);
+      if (it != g_tray.end() && it->second->hwnd) item = it->second;
+    }
+    if (!item) item = NotifierItem();
+    if (!item || !item->hwnd) return;
+
+    NOTIFYICONDATAW data = {sizeof(data)};
+    data.hWnd = item->hwnd;
+    data.uID = 1;
+    data.uFlags = NIF_INFO;
+    // NIIF_USER would show the tray icon itself, which for our own quiet
+    // notifier is the generic application icon — worse than the system's.
+    data.dwInfoFlags = urgency == "critical" ? NIIF_ERROR
+                       : urgency == "low"    ? NIIF_NONE
+                                             : NIIF_INFO;
+    ::wcsncpy_s(data.szInfoTitle, title.c_str(), _TRUNCATE);
+    ::wcsncpy_s(data.szInfo, body.c_str(), _TRUNCATE);
+    ::Shell_NotifyIconW(NIM_MODIFY, &data);
+  });
+  return Napi::Boolean::New(env, true);
+}
+
+// --- staying awake ----------------------------------------------------------
+
+// keepAwake(display) -> true while it holds
+//
+// ES_CONTINUOUS is the difference between a request and a state: without it
+// the call is a one-shot nudge that resets the idle timer once, and with it
+// the flags stay in force until they are cleared. So this is a switch rather
+// than a heartbeat, and the release is `keepAwake(null)`.
+//
+// Per *thread*, which is why it runs on the UI thread: the state belongs to
+// the thread that set it and dies with it, and Node's main thread is not the
+// one that outlives everything here.
+Napi::Value KeepAwake(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const bool release = info[0].IsNull() || info[0].IsUndefined();
+  const bool display = !release && info[0].ToBoolean().Value();
+
+  PostToUiThread([release, display]() {
+    if (release) {
+      ::SetThreadExecutionState(ES_CONTINUOUS);
+      return;
+    }
+    ::SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED |
+                              (display ? ES_DISPLAY_REQUIRED : 0));
+  });
+  return Napi::Boolean::New(env, true);
+}
+
+// lastInputMs() -> milliseconds since the user last touched anything
+//
+// GetLastInputInfo is session-wide: it answers for the whole desktop, not for
+// this app's windows, which is what an idle timeout means. The tick counter it
+// reports in wraps every 49.7 days, and so does GetTickCount, so the
+// subtraction is right across the wrap as long as both are read as unsigned.
+Napi::Value LastInputMs(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  LASTINPUTINFO last = {sizeof(last)};
+  if (!::GetLastInputInfo(&last)) return env.Null();
+  const DWORD now = ::GetTickCount();
+  return Napi::Number::New(env, static_cast<double>(now - last.dwTime));
+}
+
 // --- the taskbar button -----------------------------------------------------
 
 ITaskbarList3* g_taskbar = nullptr;
@@ -597,4 +726,7 @@ void InitShellExports(Napi::Env env, Napi::Object exports) {
   set("fileDialog", FileDialog);
   set("registerHotkey", RegisterHotkey);
   set("unregisterHotkey", UnregisterHotkey);
+  set("trayNotify", TrayNotify);
+  set("keepAwake", KeepAwake);
+  set("lastInputMs", LastInputMs);
 }

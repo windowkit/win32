@@ -75,6 +75,12 @@ struct Window {
   // `<window transparent>`: the app draws its own shape and the rest shows
   // through. Together with `popup` this decides the surface's alpha mode.
   bool transparent = false;
+  // Windows has no fullscreen state: it is the decorations taken off and the
+  // window sized to the monitor. What it was before that is kept here, because
+  // recomputing it from a default would lose whatever the window actually was.
+  bool fullscreen = false;
+  LONG_PTR framedStyle = 0;
+  RECT framedRect = {};
 };
 
 std::mutex g_mutex;
@@ -385,6 +391,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
     case WM_SYSKEYUP:
       EmitKey(window, "keyup", wparam, lparam);
       return 0;
+    case WM_ACTIVATE:
+      // The window the keyboard is talking to. WM_ACTIVATE rather than
+      // WM_SETFOCUS because these are top-level windows and activation is the
+      // thing a person sees — the title bar lighting up, the caret blinking.
+      Emit(Event{LOWORD(wparam) == WA_INACTIVE ? "window-blur" : "window-focus",
+                 window->id});
+      return ::DefWindowProcW(hwnd, message, wparam, lparam);
     case WM_CLOSE:
       // A close request is the app's to answer, never the platform's: emit it
       // and let JS decide. This is the X11 contract's WM_DELETE_WINDOW.
@@ -855,6 +868,112 @@ Napi::Value WindowPixels(const Napi::CallbackInfo& info) {
   return out;
 }
 
+// --- window states ----------------------------------------------------------
+//
+// What EWMH calls `_NET_WM_STATE` and what a Windows window calls four
+// unrelated APIs. The vocabulary is the renderer's, because `<window>` speaks
+// it on every backend: `maximized`, `minimized`, `fullscreen`, `above` and
+// `focused`.
+//
+// Fullscreen is the one with no call of its own. Windows has no fullscreen
+// window state — what every application does is take the decorations off and
+// size the window to the monitor, and put them back afterwards — so the frame
+// it had is remembered here and restored, rather than recomputed from a
+// default that would lose whatever the window actually was.
+
+bool StateOn(Window* window, const std::string& name) {
+  if (!window->hwnd) return false;
+  if (name == "maximized") return ::IsZoomed(window->hwnd) == TRUE;
+  if (name == "minimized" || name == "hidden") return ::IsIconic(window->hwnd) == TRUE;
+  if (name == "fullscreen") return window->fullscreen;
+  if (name == "above") {
+    return (::GetWindowLongPtrW(window->hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+  }
+  if (name == "focused") return ::GetForegroundWindow() == window->hwnd;
+  return false;
+}
+
+void EnterFullscreen(Window* window) {
+  if (window->fullscreen || !window->hwnd) return;
+  window->framedStyle = ::GetWindowLongPtrW(window->hwnd, GWL_STYLE);
+  ::GetWindowRect(window->hwnd, &window->framedRect);
+
+  MONITORINFO monitor = {sizeof(monitor)};
+  HMONITOR screen = ::MonitorFromWindow(window->hwnd, MONITOR_DEFAULTTONEAREST);
+  if (!::GetMonitorInfoW(screen, &monitor)) return;
+
+  ::SetWindowLongPtrW(window->hwnd, GWL_STYLE,
+                      window->framedStyle & ~(WS_CAPTION | WS_THICKFRAME));
+  // rcMonitor rather than rcWork: fullscreen covers the taskbar, which is what
+  // makes it fullscreen rather than maximized.
+  ::SetWindowPos(window->hwnd, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
+                 monitor.rcMonitor.right - monitor.rcMonitor.left,
+                 monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+  window->fullscreen = true;
+}
+
+void LeaveFullscreen(Window* window) {
+  if (!window->fullscreen || !window->hwnd) return;
+  ::SetWindowLongPtrW(window->hwnd, GWL_STYLE, window->framedStyle);
+  ::SetWindowPos(window->hwnd, HWND_TOP, window->framedRect.left, window->framedRect.top,
+                 window->framedRect.right - window->framedRect.left,
+                 window->framedRect.bottom - window->framedRect.top,
+                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+  window->fullscreen = false;
+}
+
+// windowState(id, name, on) -> whether this backend has that state at all
+//
+// False means "not a state here", which is what `<window>` reads to know its
+// request went nowhere — never "the call failed". The work happens on the UI
+// thread, so the answer is about the vocabulary rather than the outcome.
+Napi::Value WindowState(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
+  if (!window) return Napi::Boolean::New(env, false);
+  const std::string name = info[1].As<Napi::String>().Utf8Value();
+  const bool on = info[2].ToBoolean().Value();
+  if (name != "maximized" && name != "minimized" && name != "hidden" &&
+      name != "fullscreen" && name != "above" && name != "focused") {
+    return Napi::Boolean::New(env, false);
+  }
+
+  PostToUiThread([window, name, on]() {
+    if (!window->hwnd) return;
+    if (name == "maximized") {
+      ::ShowWindow(window->hwnd, on ? SW_MAXIMIZE : SW_RESTORE);
+    } else if (name == "minimized" || name == "hidden") {
+      ::ShowWindow(window->hwnd, on ? SW_MINIMIZE : SW_RESTORE);
+    } else if (name == "fullscreen") {
+      if (on) EnterFullscreen(window);
+      else LeaveFullscreen(window);
+    } else if (name == "above") {
+      ::SetWindowPos(window->hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    } else if (name == "focused" && on) {
+      // The shell refuses this for a process that is not already in front,
+      // and refusing is the documented behaviour rather than a failure:
+      // taking focus from whoever has it is not ours to do.
+      ::SetForegroundWindow(window->hwnd);
+    }
+  });
+  return Napi::Boolean::New(env, true);
+}
+
+// windowStates(id) -> the ones that are on, as the renderer names them
+Napi::Value WindowStates(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
+  Napi::Array out = Napi::Array::New(env);
+  if (!window) return out;
+  uint32_t at = 0;
+  for (const char* name : {"maximized", "minimized", "fullscreen", "above", "focused"}) {
+    if (StateOn(window, name)) out.Set(at++, Napi::String::New(env, name));
+  }
+  return out;
+}
+
 Napi::Value BeginDraw(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
@@ -1202,6 +1321,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("setTitle", Napi::Function::New(env, SetTitle));
   exports.Set("resizeWindow", Napi::Function::New(env, ResizeWindow));
   exports.Set("moveWindow", Napi::Function::New(env, MoveWindow));
+  exports.Set("windowState", Napi::Function::New(env, WindowState));
+  exports.Set("windowStates", Napi::Function::New(env, WindowStates));
   exports.Set("destroyWindow", Napi::Function::New(env, DestroyWindow_));
   exports.Set("listScreens", Napi::Function::New(env, ListScreens));
   exports.Set("windowHandle", Napi::Function::New(env, WindowHandle));
