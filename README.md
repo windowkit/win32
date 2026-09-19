@@ -3,9 +3,10 @@
 The mechanism-only Win32 bridge for [react-x11](https://github.com/sidorares/react-x11),
 sibling to [`@windowkit/appkit`](https://github.com/windowkit/appkit).
 
-**Status: the Phase 0 spike.** A real window, painted from Node, with input
-coming back. The verb table, the text engine and the platform services are not
-written yet — see [What is missing](#what-is-missing).
+**Status: in use.** The verb table, DirectWrite, input, GL and most of the
+shell integrations are built, and react-x11's examples run on them. Drag and
+drop, IME and UI Automation are not — see
+[What is missing](#what-is-missing).
 
 It exports verbs, handles and events — no policy, no widget logic, no JS canvas
 class. Those live in the renderer, so that one context wrapper can drive this
@@ -40,11 +41,12 @@ sockets keep reading and React keeps committing throughout. That is the standing
 cost of the Cocoa backend's pump ([react-x11#484](https://github.com/sidorares/react-x11/pull/484))
 and this design does not pay it.
 
-## Running the spike
+## Running it
 
 ```
 npm install
 npm run build
+npm test              # the whole suite, on a desktop
 npm run demo          # twelve seconds, then exits
 node examples/window.js --keep
 ```
@@ -54,7 +56,7 @@ its cadence while you drag the window or hold its title bar, the threading model
 holds on your machine. Measured on Windows 11 build 26200: 46 ticks against ~48
 due over twelve seconds.
 
-## What it does today
+## What it does
 
 ```js
 const win32 = require('@windowkit/win32');
@@ -66,13 +68,13 @@ win32.probe();
 // { d3d11: true, warp: false, direct2d: true, directwrite: true,
 //   directcomposition: true, adapter: 'NVIDIA GeForce GTX 1080 Ti' }
 
-win32.start((event) => { /* window-ready, resize, mouse*, keydown, close, dpichanged */ });
+win32.start((event) => { /* window-ready, resize, mouse*, key*, window-focus, close… */ });
 const id = win32.createWindow({ title: 'hello', width: 900, height: 600 });
 // on 'window-ready':
-win32.compose(id);                       // target, root visual, virtual surface
-win32.beginDraw(id, x, y, w, h);         // one damage rect
-win32.clear(id, r, g, b);
-win32.fillRect(id, x, y, w, h, r, g, b, a);
+win32.compose(id);                        // target, root visual, virtual surface
+const s = win32.beginDraw(id, x, y, w, h); // one damage rect -> a surface handle
+win32.ctxSetFillColor(s, r, g, b, a);
+win32.ctxFillRect(s, x, y, w, h);
 win32.endDraw(id);
 win32.commit();
 win32.show(id, true);
@@ -90,22 +92,55 @@ present a DirectComposition surface.
 Painting is **one `BeginDraw` per damage rect** on a virtual surface: every pixel
 inside the rect is repainted, every pixel outside it is kept. That is the X11
 damage model verbatim, which is why react-x11's paint cache, its damage-rect
-list and its cull carry over untouched.
+list and its cull carry over untouched. The surface handle a `beginDraw` answers
+is the same shape an offscreen surface has, so the renderer's context wrapper
+cannot tell a window from a bitmap.
+
+Roughly by area:
+
+| | |
+| --- | --- |
+| **drawing** | 36 `ctx*` verbs on a Direct2D device context: paths, arcs, rounded rects, clips (axis-aligned and layered), gradients, shadows, images, `getImageData`/`putImageData`, `drawSurface` |
+| **text** | DirectWrite layouts with per-span formatting, line metrics, hit testing and carets; font matching, enumeration and loading; glyph runs (`fontHandle`, `fontGlyphForCodepoint`, `fontGlyphAdvances`, `ctxDrawGlyphs`); variable font axes |
+| **windows** | create, show, move, resize, title, popups, transparency, DPI, `scrollRegion`, states (maximized, minimized, fullscreen, above, focused), `windowPixels` |
+| **input** | pointer with all five buttons and capture, wheel, keyboard through `ToUnicodeEx`, activation |
+| **GL** | a WGL context and `WGL_NV_DX_interop2` onto the composed surface |
+| **the shell** | tray icon and menu, taskbar progress, overlay icon and flash, the Common Item Dialog, global hotkeys, notification balloons, `SetThreadExecutionState`, `GetLastInputInfo` |
+| **the desktop** | screens, system appearance, themed control bezels, clipboard, screen colour sampling |
+
+[docs/windows-integrations.md](https://github.com/sidorares/react-x11/blob/master/docs/windows-integrations.md)
+in the react-x11 repository is the status of the desktop integrations seen from
+the renderer's side — including the ones that are not here.
 
 ## What is missing
 
-Everything between this and an app. In rough order:
+- **drag and drop** — `IDropTarget` and `DoDragDrop` over OLE. The largest gap:
+  it works on X11 and on macOS and does nothing here.
+- **IME** — no `WM_IME_*` handling, so composition never starts and CJK input
+  does not work.
+- **UI Automation** — `WM_GETOBJECT` is unhandled, so a screen reader sees a
+  bare window.
+- **jump lists**, and the activation that would make them useful: file
+  associations, URL schemes, and a second launch that hands its arguments to
+  the first.
+- **pointer and keyboard grabs** — `SetCapture` holds only while a button is
+  down, so a popup cannot be dismissed by a click outside it the way it is on
+  X11.
 
-- **the verb table** — ~36 `ctx*` verbs over a Direct2D device context: paths,
-  clips, gradients, images, `drawGlyphs`. Two exist.
-- **DirectWrite** behind react-x11's text engine contract. This is the blocker
-  for running anything real: text measurement runs through a yoga measure
-  function, so without it every `<text>` measures 0×0 and nothing lays out.
-- **`IDCompositionSurface::Scroll`**, the scroll-blit fast path.
-- **input** — the key/char pairing, AltGr, the wheel, `WM_POINTER`.
-- **the window vocabulary** — popups, geometry, DWM attributes, hit-test regions.
-- **the services** — clipboard and drag and drop over OLE, the Common Item
-  Dialog, the tray, toasts.
+## Testing
+
+`npm test` runs all of it. The suite is split by what each part needs from the
+machine, because a CI runner is not a desktop:
+
+| | needs | runs in CI |
+| --- | --- | --- |
+| `test:unit` | nothing but the process — Direct2D, DirectWrite, the theme engine | yes, and it gates the build |
+| `test:window` | a session with a desktop to compose into | reports, does not gate |
+| `test:shell` | the notification area, the taskbar, a dialog | reports, does not gate |
+| `test:gpu` | a vendor OpenGL driver | reports, does not gate |
+
+A hosted runner has no GPU: the WGL it offers is the 1.1 software rasterizer,
+and `test:gpu` asks for a core context on purpose.
 
 ## Building
 
@@ -113,12 +148,21 @@ Needs Visual Studio with the **Desktop development with C++** workload, a
 Windows 10/11 SDK, and Python (node-gyp's own prerequisite).
 
 `npm run build:prebuild` files the binary under `prebuilds/win32-<arch>/`, which
-is where `index.js` looks first and what CI publishes. Prebuilds ship for
-`win32-x64` and `win32-arm64`; any other architecture builds from source.
+is where `index.js` looks and what CI publishes. Prebuilds ship for `win32-x64`
+and `win32-arm64`, each built on a runner of its own architecture — nothing
+cross-compiles, because a binary that was never run is not a binary worth
+shipping to the one machine that cannot build its own. `npm run check:arch`
+reads the PE header and says what a binary actually is.
+
+Any other architecture builds from source on install, and a failure there is a
+warning rather than an error: this package is an optional dependency of
+react-x11, and the renderer's answer to a missing backend is to use another one.
 
 `WINDOWKIT_WIN32_PATH` points the loader at a `win32.node` elsewhere — a
 checkout under development, or a binary shipped beside a single-executable
 build, where `require` has no `node_modules` to walk.
+
+[docs/releasing.md](docs/releasing.md) covers how a version gets out.
 
 ## License
 
