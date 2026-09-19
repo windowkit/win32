@@ -720,6 +720,98 @@ Napi::Value Compose(const Napi::CallbackInfo& info) {
 // the window's frame and an offscreen bitmap are drawn through exactly the
 // same table, and src/backend/context2d.js cannot tell which it has. Answers 0
 // when the surface refuses, which a caller reads as "no frame this time".
+// windowPixels(id, x, y, w, h) -> RGBA bytes of the window's own content
+//
+// A DirectComposition surface is write-only: what BeginDraw hands back is a
+// target, and there is no matching read. The window's pixels are DWM's, and
+// PrintWindow is the one door it opens on them — but only with both flags.
+// Measured on this machine, on a window like the ones this backend makes:
+//
+//   flags 0                                -> a black rectangle
+//   PW_CLIENTONLY                          -> a black rectangle
+//   PW_RENDERFULLCONTENT                   -> the frame, not the content
+//   PW_CLIENTONLY | PW_RENDERFULLCONTENT   -> the content
+//
+// PW_RENDERFULLCONTENT is what makes DWM render a composed window rather
+// than replaying WM_PRINT, which a window that never draws with GDI would
+// answer with nothing at all.
+//
+// The whole client area is printed and the asked-for rect cut out of it,
+// because PrintWindow has no source rect: it draws the window at the DC's
+// origin and stops.
+Napi::Value WindowPixels(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
+  if (!window || !window->hwnd) return env.Null();
+
+  RECT client = {};
+  ::GetClientRect(window->hwnd, &client);
+  const int fullWidth = client.right - client.left;
+  const int fullHeight = client.bottom - client.top;
+  if (fullWidth <= 0 || fullHeight <= 0) return env.Null();
+
+  const int x = (std::max)(0, info[1].As<Napi::Number>().Int32Value());
+  const int y = (std::max)(0, info[2].As<Napi::Number>().Int32Value());
+  const int width =
+      (std::min)(info[3].As<Napi::Number>().Int32Value(), fullWidth - x);
+  const int height =
+      (std::min)(info[4].As<Napi::Number>().Int32Value(), fullHeight - y);
+  if (width <= 0 || height <= 0) return env.Null();
+
+  // A top-down 32-bit DIB, so the rows come out in the order a caller reads
+  // them and the bytes are already four wide.
+  BITMAPINFO info32 = {};
+  info32.bmiHeader.biSize = sizeof(info32.bmiHeader);
+  info32.bmiHeader.biWidth = fullWidth;
+  info32.bmiHeader.biHeight = -fullHeight;
+  info32.bmiHeader.biPlanes = 1;
+  info32.bmiHeader.biBitCount = 32;
+  info32.bmiHeader.biCompression = BI_RGB;
+
+  HDC screen = ::GetDC(nullptr);
+  HDC memory = ::CreateCompatibleDC(screen);
+  void* bits = nullptr;
+  HBITMAP bitmap =
+      ::CreateDIBSection(screen, &info32, DIB_RGB_COLORS, &bits, nullptr, 0);
+  ::ReleaseDC(nullptr, screen);
+  if (!bitmap || !bits) {
+    if (bitmap) ::DeleteObject(bitmap);
+    ::DeleteDC(memory);
+    return env.Null();
+  }
+  HGDIOBJ previous = ::SelectObject(memory, bitmap);
+  const BOOL printed =
+      ::PrintWindow(window->hwnd, memory, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
+
+  Napi::Value out = env.Null();
+  if (printed) {
+    Napi::Buffer<uint8_t> pixels =
+        Napi::Buffer<uint8_t>::New(env, static_cast<size_t>(width) * height * 4);
+    uint8_t* dst = pixels.Data();
+    const uint8_t* src = static_cast<const uint8_t*>(bits);
+    for (int row = 0; row < height; row++) {
+      const uint8_t* line = src + static_cast<size_t>(y + row) * fullWidth * 4 + x * 4;
+      for (int col = 0; col < width; col++) {
+        // BGRA from GDI, RGBA to the caller. Opaque, because a window's own
+        // content is: the alpha a DIB comes back with is not meaningful here
+        // and a texture made from it would be invisible.
+        dst[0] = line[2];
+        dst[1] = line[1];
+        dst[2] = line[0];
+        dst[3] = 0xff;
+        dst += 4;
+        line += 4;
+      }
+    }
+    out = pixels;
+  }
+
+  ::SelectObject(memory, previous);
+  ::DeleteObject(bitmap);
+  ::DeleteDC(memory);
+  return out;
+}
+
 Napi::Value BeginDraw(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
@@ -1026,6 +1118,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("createWindow", Napi::Function::New(env, CreateWindowExport));
   exports.Set("show", Napi::Function::New(env, Show));
   exports.Set("compose", Napi::Function::New(env, Compose));
+  exports.Set("windowPixels", Napi::Function::New(env, WindowPixels));
   exports.Set("beginDraw", Napi::Function::New(env, BeginDraw));
   exports.Set("endDraw", Napi::Function::New(env, EndDraw));
   exports.Set("scrollRegion", Napi::Function::New(env, ScrollRegion));
