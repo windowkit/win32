@@ -76,6 +76,162 @@ std::wstring ResolveFamily(const std::wstring& family) {
   return family;
 }
 
+// --- fonts the app brings with it ------------------------------------------
+//
+// `loadFont()` hands over a .ttf/.otf path or the bytes of one, and everything
+// afterwards asks for it by family name like any installed font. DirectWrite
+// keeps app-supplied faces in a collection of their own, so what this holds is
+// that collection plus the file references it was built from — a font set is
+// immutable, so adding a face means building a new one from all of them.
+//
+// A text format names *one* collection, and naming the custom one hides every
+// installed font from that format. So CollectionFor() answers the custom
+// collection only for a family that is actually in it, and nullptr — meaning
+// the system collection — for everything else.
+
+std::vector<IDWriteFontFile*> g_loadedFiles;
+IDWriteFontCollection1* g_loaded = nullptr;
+IDWriteInMemoryFontFileLoader* g_memoryLoader = nullptr;
+
+void RebuildLoadedCollection() {
+  if (g_loaded) {
+    g_loaded->Release();
+    g_loaded = nullptr;
+  }
+  if (g_loadedFiles.empty()) return;
+  IDWriteFontSetBuilder* builder = nullptr;
+  if (FAILED(g_dwrite->CreateFontSetBuilder(&builder))) return;
+  for (IDWriteFontFile* file : g_loadedFiles) {
+    BOOL supported = FALSE;
+    DWRITE_FONT_FILE_TYPE fileType = DWRITE_FONT_FILE_TYPE_UNKNOWN;
+    DWRITE_FONT_FACE_TYPE faceType = DWRITE_FONT_FACE_TYPE_UNKNOWN;
+    UINT32 faces = 0;
+    if (FAILED(file->Analyze(&supported, &fileType, &faceType, &faces)) || !supported) {
+      continue;
+    }
+    for (UINT32 face = 0; face < faces; face++) {
+      IDWriteFontFaceReference* reference = nullptr;
+      if (SUCCEEDED(g_dwrite->CreateFontFaceReference(file, face,
+                                                      DWRITE_FONT_SIMULATIONS_NONE,
+                                                      &reference))) {
+        builder->AddFontFaceReference(reference);
+        reference->Release();
+      }
+    }
+  }
+  IDWriteFontSet* set = nullptr;
+  if (SUCCEEDED(builder->CreateFontSet(&set))) {
+    g_dwrite->CreateFontCollectionFromFontSet(set, &g_loaded);
+    set->Release();
+  }
+  builder->Release();
+}
+
+// The collection a format or a range should name for this family: the app's
+// own where the family came from there, the system's otherwise.
+IDWriteFontCollection* CollectionFor(const std::wstring& family) {
+  if (!g_loaded) return nullptr;
+  UINT32 index = 0;
+  BOOL exists = FALSE;
+  if (FAILED(g_loaded->FindFamilyName(family.c_str(), &index, &exists))) return nullptr;
+  return exists ? g_loaded : nullptr;
+}
+
+// The first family name in a file, which is what the caller gets back to ask
+// for the font by. An app that passes its own `family` overrides it above.
+std::wstring FirstFamilyOf(IDWriteFontFile* file) {
+  IDWriteFontSetBuilder* builder = nullptr;
+  if (FAILED(g_dwrite->CreateFontSetBuilder(&builder))) return L"";
+  std::wstring name;
+  IDWriteFontFaceReference* reference = nullptr;
+  if (SUCCEEDED(g_dwrite->CreateFontFaceReference(file, 0, DWRITE_FONT_SIMULATIONS_NONE,
+                                                  &reference))) {
+    builder->AddFontFaceReference(reference);
+    reference->Release();
+    IDWriteFontSet* set = nullptr;
+    if (SUCCEEDED(builder->CreateFontSet(&set))) {
+      IDWriteFontCollection1* collection = nullptr;
+      if (SUCCEEDED(g_dwrite->CreateFontCollectionFromFontSet(set, &collection)) &&
+          collection->GetFontFamilyCount() > 0) {
+        IDWriteFontFamily* family = nullptr;
+        if (SUCCEEDED(collection->GetFontFamily(0, &family))) {
+          IDWriteLocalizedStrings* names = nullptr;
+          if (SUCCEEDED(family->GetFamilyNames(&names)) && names->GetCount() > 0) {
+            UINT32 length = 0;
+            names->GetStringLength(0, &length);
+            std::vector<wchar_t> buffer(length + 1, 0);
+            names->GetString(0, buffer.data(), length + 1);
+            name = buffer.data();
+          }
+          if (names) names->Release();
+          family->Release();
+        }
+      }
+      if (collection) collection->Release();
+      set->Release();
+    }
+  }
+  builder->Release();
+  return name;
+}
+
+// fontLoad(pathOrBytes) -> { family } | null
+Napi::Value FontLoad(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!g_dwrite) return env.Null();
+
+  IDWriteFontFile* file = nullptr;
+  if (info[0].IsString()) {
+    const std::wstring path = Wide(info[0]);
+    if (FAILED(g_dwrite->CreateFontFileReference(path.c_str(), nullptr, &file))) {
+      return env.Null();
+    }
+  } else if (info[0].IsBuffer() || info[0].IsTypedArray()) {
+    // Bytes need a loader of their own, which is DirectWrite 5's business.
+    // Registered once and kept: unregistering it would invalidate every face
+    // already made from data.
+    if (!g_memoryLoader) {
+      IDWriteFactory5* factory5 = nullptr;
+      if (FAILED(g_dwrite->QueryInterface(__uuidof(IDWriteFactory5),
+                                          reinterpret_cast<void**>(&factory5)))) {
+        return env.Null();
+      }
+      if (SUCCEEDED(factory5->CreateInMemoryFontFileLoader(&g_memoryLoader))) {
+        factory5->RegisterFontFileLoader(g_memoryLoader);
+      }
+      factory5->Release();
+      if (!g_memoryLoader) return env.Null();
+    }
+    void* data = nullptr;
+    size_t size = 0;
+    if (info[0].IsBuffer()) {
+      Napi::Buffer<uint8_t> buffer = info[0].As<Napi::Buffer<uint8_t>>();
+      data = buffer.Data();
+      size = buffer.Length();
+    } else {
+      Napi::TypedArray array = info[0].As<Napi::TypedArray>();
+      data = static_cast<uint8_t*>(array.ArrayBuffer().Data()) + array.ByteOffset();
+      size = array.ByteLength();
+    }
+    // The loader copies, so the JS buffer may go away right after this.
+    if (FAILED(g_memoryLoader->CreateInMemoryFontFileReference(
+            g_dwrite, data, static_cast<UINT32>(size), nullptr, &file))) {
+      return env.Null();
+    }
+  } else {
+    return env.Null();
+  }
+
+  const std::wstring family = FirstFamilyOf(file);
+  g_loadedFiles.push_back(file);
+  RebuildLoadedCollection();
+
+  Napi::Object out = Napi::Object::New(env);
+  out.Set("family", Napi::String::New(
+                        env, reinterpret_cast<const char16_t*>(family.c_str())));
+  return out;
+}
+
 // --- exports ---------------------------------------------------------------
 
 // layoutCreate(text, { family, size, weight, italic, maxWidth, align,
@@ -116,7 +272,7 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
 
   IDWriteTextFormat* format = nullptr;
   HRESULT hr = g_dwrite->CreateTextFormat(
-      family.c_str(), nullptr, WeightOf(weight),
+      family.c_str(), CollectionFor(family), WeightOf(weight),
       italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
       DWRITE_FONT_STRETCH_NORMAL, size, L"", &format);
   if (FAILED(hr) || !format) {
@@ -171,7 +327,13 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
                                  span.Get("length").As<Napi::Number>().Uint32Value()};
       if (range.length == 0) continue;
       if (Given(span, "family")) {
-        layout->SetFontFamilyName(ResolveFamily(Wide(span.Get("family"))).c_str(), range);
+        const std::wstring spanFamily = ResolveFamily(Wide(span.Get("family")));
+        // The collection first: setting the name against the wrong one leaves
+        // the range resolving to a fallback rather than to the loaded face.
+        if (IDWriteFontCollection* loaded = CollectionFor(spanFamily)) {
+          layout->SetFontCollection(loaded, range);
+        }
+        layout->SetFontFamilyName(spanFamily.c_str(), range);
       }
       if (Given(span, "size")) {
         layout->SetFontSize(
@@ -470,12 +632,16 @@ Napi::Value FontMetrics(const Napi::CallbackInfo& info) {
 Napi::Value FontExists(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (!g_dwrite) return Napi::Boolean::New(env, false);
+  // A font the app loaded exists as much as an installed one does, and this
+  // is what a match asks before falling back.
+  const std::wstring wanted = Wide(info[0]);
+  if (CollectionFor(wanted)) return Napi::Boolean::New(env, true);
   IDWriteFontCollection* collection = nullptr;
   g_dwrite->GetSystemFontCollection(&collection);
   if (!collection) return Napi::Boolean::New(env, false);
   UINT32 index = 0;
   BOOL exists = FALSE;
-  collection->FindFamilyName(Wide(info[0]).c_str(), &index, &exists);
+  collection->FindFamilyName(wanted.c_str(), &index, &exists);
   collection->Release();
   return Napi::Boolean::New(env, exists == TRUE);
 }
@@ -529,4 +695,5 @@ void InitTextExports(Napi::Env env, Napi::Object exports) {
   set("fontMetrics", FontMetrics);
   set("fontExists", FontExists);
   set("listFonts", ListFonts);
+  set("fontLoad", FontLoad);
 }
