@@ -457,6 +457,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       Emit(Event{"dpichanged", window->id, static_cast<double>(LOWORD(wparam))});
       return 0;
     }
+    case WM_GETOBJECT: {
+      // A screen reader asking for the window's automation tree, answered
+      // from the mirror in src/uia.cc — never from JS, which is the whole
+      // reason there is a mirror. False means no tree has been pushed for
+      // this window yet; DefWindowProc then answers as a bare window would.
+      LRESULT answer = 0;
+      if (HandleUiaMessage(window->id, hwnd, message, wparam, lparam, &answer)) {
+        return answer;
+      }
+      return ::DefWindowProcW(hwnd, message, wparam, lparam);
+    }
     default:
       // The taskbar's own messages, which src/shell.cc owns: its button
       // appearing — the first moment a thumbnail toolbar can be added to it,
@@ -1209,8 +1220,13 @@ Napi::Value MoveWindow(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value DestroyWindow_(const Napi::CallbackInfo& info) {
-  Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
+  const int windowId = info[0].As<Napi::Number>().Int32Value();
+  Window* window = LookupWindow(windowId);
   if (!window) return info.Env().Undefined();
+  // The automation mirror is keyed by window and nothing else would drop it:
+  // a long-lived process opening windows would otherwise keep every tree it
+  // ever pushed.
+  UiaWindowGone(windowId);
   HWND hwnd = window->hwnd;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -1371,6 +1387,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitShellExports(env, exports);
   InitDndExports(env, exports);
   InitImeExports(env, exports);
+  InitUiaExports(env, exports);
   InitGlContextExports(env, exports);
   return exports;
 }

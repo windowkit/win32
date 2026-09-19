@@ -141,4 +141,12 @@ bool HandleTaskbarMessage(int windowId, UINT message, WPARAM wparam);
 bool HandleImeMessage(int windowId, HWND hwnd, UINT message, WPARAM wparam,
                       LPARAM lparam, LRESULT* result);
 void InitImeExports(Napi::Env env, Napi::Object exports);
+
+// UI Automation's WM_GETOBJECT, answered from the mirror src/uia.cc keeps.
+// False when there is no tree for this window yet, which leaves the question
+// to DefWindowProc and the window merely bare rather than broken.
+bool HandleUiaMessage(int windowId, HWND hwnd, UINT message, WPARAM wparam,
+                      LPARAM lparam, LRESULT* result);
+void UiaWindowGone(int windowId);
+void InitUiaExports(Napi::Env env, Napi::Object exports);
 void InitGlContextExports(Napi::Env env, Napi::Object exports);
