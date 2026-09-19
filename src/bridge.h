@@ -119,10 +119,14 @@ void EmitEvent(const char* type, int id, double a = 0, double b = 0, double c = 
 // See the note above their definitions in src/win32.cc.
 ID3D11Device* BridgeD3DDevice();
 IDCompositionVisual2* WindowVisual(int windowId);
+// A window's HWND, for the translation units that register things on it —
+// RegisterDragDrop wants the handle and the thread that owns it.
+HWND WindowHwnd(int windowId);
 void InitSurfaceExports(Napi::Env env, Napi::Object exports);
 void InitTextExports(Napi::Env env, Napi::Object exports);
 void InitDesktopExports(Napi::Env env, Napi::Object exports);
 void InitBezelExports(Napi::Env env, Napi::Object exports);
 void InitGlExports(Napi::Env env, Napi::Object exports);
 void InitShellExports(Napi::Env env, Napi::Object exports);
+void InitDndExports(Napi::Env env, Napi::Object exports);
 void InitGlContextExports(Napi::Env env, Napi::Object exports);

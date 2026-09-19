@@ -28,7 +28,7 @@
     "build:prebuild": "node scripts/prebuild.js",
     "test": "npm run test:unit && npm run test:window && npm run test:shell && npm run test:gpu",
     "test:unit": "node test/smoke.js && node test/text.js && node test/bezels.js",
-    "test:window": "node test/clips.js && node test/states.js",
+    "test:window": "node test/clips.js && node test/states.js && node test/dnd.js",
     "test:shell": "node test/shell.js",
     "test:gpu": "node test/gl.js",
     "demo": "node examples/window.js",

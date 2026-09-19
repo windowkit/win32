@@ -1333,6 +1333,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitBezelExports(env, exports);
   InitGlExports(env, exports);
   InitShellExports(env, exports);
+  InitDndExports(env, exports);
   InitGlContextExports(env, exports);
   return exports;
 }
@@ -1350,6 +1351,11 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 // and needs the device it must share with and the visual to hang it under.
 
 ID3D11Device* BridgeD3DDevice() { return g_d3d; }
+
+HWND WindowHwnd(int windowId) {
+  Window* window = LookupWindow(windowId);
+  return window ? window->hwnd : nullptr;
+}
 
 IDCompositionVisual2* WindowVisual(int windowId) {
   Window* window = LookupWindow(windowId);
