@@ -290,14 +290,54 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
                  horizontal ? 0 : -notches});
       return 0;
     }
+    // The buttons, numbered the way X numbers them, because that is the
+    // vocabulary the renderer's event layer speaks: 1 left, 2 middle, 3
+    // right, and 8/9 for the two side buttons. The wheel is 4..7 there and
+    // arrives here as WM_MOUSEWHEEL instead, which is handled above.
+    //
+    // Answering 0 to the right button is also what keeps DefWindowProc from
+    // turning it into WM_CONTEXTMENU and opening a menu of its own over the
+    // one the app is about to open.
     case WM_LBUTTONDOWN:
-      Emit(Event{"mousedown", window->id, static_cast<double>(GET_X_LPARAM(lparam)),
-                 static_cast<double>(GET_Y_LPARAM(lparam))});
-      return 0;
+    case WM_MBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_XBUTTONDOWN:
     case WM_LBUTTONUP:
-      Emit(Event{"mouseup", window->id, static_cast<double>(GET_X_LPARAM(lparam)),
-                 static_cast<double>(GET_Y_LPARAM(lparam))});
+    case WM_MBUTTONUP:
+    case WM_RBUTTONUP:
+    case WM_XBUTTONUP: {
+      int button = 1;
+      bool down = true;
+      switch (message) {
+        case WM_MBUTTONDOWN: button = 2; break;
+        case WM_MBUTTONUP: button = 2; down = false; break;
+        case WM_RBUTTONDOWN: button = 3; break;
+        case WM_RBUTTONUP: button = 3; down = false; break;
+        case WM_XBUTTONDOWN:
+          button = GET_XBUTTON_WPARAM(wparam) == XBUTTON2 ? 9 : 8;
+          break;
+        case WM_XBUTTONUP:
+          button = GET_XBUTTON_WPARAM(wparam) == XBUTTON2 ? 9 : 8;
+          down = false;
+          break;
+        case WM_LBUTTONUP: down = false; break;
+        default: break;
+      }
+      // A press takes the mouse so that a drag leaving the window still
+      // reports, and the matching release gives it back. Without this a
+      // drag that crosses the window edge simply stops being heard.
+      if (down) {
+        ::SetCapture(hwnd);
+      } else if (::GetCapture() == hwnd) {
+        ::ReleaseCapture();
+      }
+      Emit(Event{down ? "mousedown" : "mouseup", window->id,
+                 static_cast<double>(GET_X_LPARAM(lparam)),
+                 static_cast<double>(GET_Y_LPARAM(lparam)),
+                 static_cast<double>(button),
+                 static_cast<double>(ModifierMask())});
       return 0;
+    }
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
       // WM_SYSKEY* is the same press with Alt held. Falling through means an
