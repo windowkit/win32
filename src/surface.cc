@@ -619,7 +619,17 @@ Napi::Value CtxClip(const Napi::CallbackInfo& info) {
   } else {
     D2D1_LAYER_PARAMETERS1 params = D2D1::LayerParameters1();
     params.geometricMask = geometry;
-    params.maskTransform = s->state.transform;
+    // Identity, not the CTM: Direct2D already maps the mask through the
+    // context's world transform, exactly as it maps the rect handed to
+    // PushAxisAlignedClip above, so naming the transform again applies it
+    // twice. On a window whose CTM is identity that is the same matrix and
+    // the bug is invisible; on DirectComposition it never is, because the
+    // base transform carries the offset of the tile BeginDraw handed out —
+    // so a doubled offset put the mask somewhere else in the atlas and every
+    // draw inside the layer was clipped away. That is what made a partial
+    // repaint of a rounded pane come back as bare background: the fill
+    // before the clip landed, and nothing after it did.
+    params.maskTransform = D2D1::Matrix3x2F::Identity();
     s->dc->PushLayer(params, nullptr);
     s->clips.push_back(true);
   }

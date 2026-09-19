@@ -883,6 +883,27 @@ Napi::Value BeginDraw(const Napi::CallbackInfo& info) {
   surface->state.transform = D2D1::Matrix3x2F::Translation(
       static_cast<float>(offset.x - rect.left), static_cast<float>(offset.y - rect.top));
   SyncTransform(surface);
+  // And confine the frame to the rect it claimed, which is DirectComposition's
+  // rule rather than an optimisation: `BeginDraw` hands back a rectangle of a
+  // tile atlas shared with every other surface, and only the update rect is
+  // ours. What is beside it is undefined — slack on a quiet atlas, somebody's
+  // content on a busy one — so a painter that inks a pixel past its damage
+  // does not lose that pixel, it writes it over something, and which something
+  // depends on how the atlas happened to be packed.
+  //
+  // No bug here was traced to this — the flicker it was found while chasing was
+  // the layer mask in CtxClip (src/surface.cc). It costs one clip a frame, it
+  // turns an out-of-contract painter into a visibly missing edge rather than
+  // damage somewhere else in the window, and test/clips.js holds it to that.
+  //
+  // Recorded in `clips` like any other, so EndDraw's unwind pops it, and the
+  // base state's `clipDepth` counts it so a restore() cannot lift it.
+  surface->dc->PushAxisAlignedClip(
+      D2D1::RectF(static_cast<float>(rect.left), static_cast<float>(rect.top),
+                  static_cast<float>(rect.right), static_cast<float>(rect.bottom)),
+      D2D1_ANTIALIAS_MODE_ALIASED);
+  surface->clips.push_back(false);
+  surface->state.clipDepth = surface->clips.size();
   window->drawing = surface;
   return Napi::Number::New(env, RegisterSurface(surface));
 }
@@ -908,7 +929,18 @@ Napi::Value EndDraw(const Napi::CallbackInfo& info) {
   ForgetSurface(surface->id);
   delete surface;
   window->drawing = nullptr;
-  window->surface->EndDraw();
+  // Direct2D reports nothing as it draws: a call with a bad parameter puts the
+  // context into an error state, every later call in the frame is ignored, and
+  // the HRESULT arrives here, once, for the whole frame. Discarded, a frame
+  // that drew nothing would look exactly like a frame that drew everything —
+  // which is the shape of failure this backend has been most expensive in, so
+  // it is reported, and loudly, because no level of it is normal.
+  const HRESULT hr = window->surface->EndDraw();
+  if (FAILED(hr)) {
+    fprintf(stderr, "[win32] EndDraw failed: 0x%08lX — the frame was dropped\n",
+            static_cast<unsigned long>(hr));
+    fflush(stderr);
+  }
   return env.Undefined();
 }
 
