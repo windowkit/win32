@@ -553,33 +553,56 @@ class SimpleDropSource : public IDropSource {
     return left;
   }
 
+  // **The motion.** `DoDragDrop` calls this every time it sees the mouse or
+  // the keys move, which is the only per-move callback the source gets —
+  // and the position is not a parameter, so it comes from the cursor.
+  //
+  // This used to live in `GiveFeedback`, on the belief that that one is
+  // "called on every motion". It is not: OLE calls `GiveFeedback` when the
+  // **drop effect** changes, which over a drag down a list is a handful of
+  // times. Measured on a three-and-a-half second drag asking for sixty
+  // moves, the source reported **seven**, with gaps up to 418ms — and the
+  // frames followed exactly, 9 a second with the same gaps. Nothing was
+  // slow: the event loop was clean and a frame cost 2.4ms. The gesture was
+  // simply not being reported, and that is the whole of the jank.
   HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escape, DWORD keys) override {
     if (escape) return DRAGDROP_S_CANCEL;
     if (!(keys & (MK_LBUTTON | MK_RBUTTON))) return DRAGDROP_S_DROP;
+    ReportMotion();
     return S_OK;
   }
 
-  // The only place the source hears about the gesture while the shell owns
-  // it. `DoDragDrop` reports no motion — this is called on every one, and
-  // the position comes from the cursor rather than from a parameter because
-  // there is none. It is what a `<popup dragPreview>` follows and what
-  // `onDrag` is called with.
+  // The effect — what the thing under the cursor would do with the drop. A
+  // change here is news even when the cursor has not moved, so it reports
+  // too, which is what `<popup dragPreview>` follows to change its cue.
   HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD effect) override {
-    POINT at = {};
-    ::GetCursorPos(&at);
-    if (at.x != last_.x || at.y != last_.y) {
-      last_ = at;
-      EmitEvent("drag-session-moved", windowId_, at.x, at.y,
-                static_cast<double>(effect));
-    }
+    effect_ = effect;
+    ReportMotion();
     return DRAGDROP_S_USEDEFAULTCURSORS;
   }
 
   int windowId_ = 0;
 
  private:
+  // One event per distinct cursor position, plus one whenever the effect
+  // changes under a cursor that has not. `QueryContinueDrag` is called from
+  // the modal loop far more often than the mouse actually moves, so the
+  // position is the rate limit: what crosses to JS is what a hand did, not
+  // how often Windows asked.
+  void ReportMotion() {
+    POINT at = {};
+    ::GetCursorPos(&at);
+    if (at.x == last_.x && at.y == last_.y && effect_ == reported_) return;
+    last_ = at;
+    reported_ = effect_;
+    EmitEvent("drag-session-moved", windowId_, at.x, at.y,
+              static_cast<double>(effect_));
+  }
+
   ULONG refs_ = 1;
   POINT last_ = {-1, -1};
+  DWORD effect_ = DROPEFFECT_NONE;
+  DWORD reported_ = 0xFFFFFFFF;
 };
 
 // --- exports ----------------------------------------------------------------
