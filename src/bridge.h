@@ -153,4 +153,10 @@ void InitUiaExports(Napi::Env env, Napi::Object exports);
 // A `<Frame>` pane's pixels: the pane's swapchain over a shared composition
 // surface handle, and the host's visual bound to the same handle (src/pane.cc).
 void InitPaneExports(Napi::Env env, Napi::Object exports);
+
+// The frame clock: a thread waiting on the compositor, so a paced frame is
+// asked for when the compositor is ready for one rather than when a JS timer
+// happens to fire. See src/frameclock.cc for why that is not the same thing.
+void InitFrameClockExports(Napi::Env env, Napi::Object exports);
+void StopFrameClock();
 void InitGlContextExports(Napi::Env env, Napi::Object exports);

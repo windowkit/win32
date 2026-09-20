@@ -1339,6 +1339,9 @@ Napi::Value Stop(const Napi::CallbackInfo& info) {
   if (!g_running) return info.Env().Undefined();
   g_running = false;
 
+  // Before the channel closes: the clock's thread reaches JS through it.
+  StopFrameClock();
+
   PostCommand([]() {
     std::lock_guard<std::mutex> lock(g_mutex);
     for (auto& entry : g_windows) {
@@ -1389,6 +1392,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitImeExports(env, exports);
   InitUiaExports(env, exports);
   InitPaneExports(env, exports);
+  InitFrameClockExports(env, exports);
   InitGlContextExports(env, exports);
   return exports;
 }
