@@ -149,4 +149,8 @@ bool HandleUiaMessage(int windowId, HWND hwnd, UINT message, WPARAM wparam,
                       LPARAM lparam, LRESULT* result);
 void UiaWindowGone(int windowId);
 void InitUiaExports(Napi::Env env, Napi::Object exports);
+
+// A `<Frame>` pane's pixels: the pane's swapchain over a shared composition
+// surface handle, and the host's visual bound to the same handle (src/pane.cc).
+void InitPaneExports(Napi::Env env, Napi::Object exports);
 void InitGlContextExports(Napi::Env env, Napi::Object exports);

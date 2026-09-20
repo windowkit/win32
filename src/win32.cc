@@ -1388,6 +1388,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitDndExports(env, exports);
   InitImeExports(env, exports);
   InitUiaExports(env, exports);
+  InitPaneExports(env, exports);
   InitGlContextExports(env, exports);
   return exports;
 }
