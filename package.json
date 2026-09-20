@@ -20,8 +20,12 @@
     "scripts/",
     "prebuilds/",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "install": "node scripts/install.js",
     "build": "node-gyp rebuild",
