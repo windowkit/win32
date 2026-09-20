@@ -3,9 +3,9 @@
 The mechanism-only Win32 bridge for [react-x11](https://github.com/sidorares/react-x11),
 sibling to [`@windowkit/appkit`](https://github.com/windowkit/appkit).
 
-**Status: in use.** The verb table, DirectWrite, input, GL and most of the
-shell integrations are built, and react-x11's examples run on them. Drag and
-drop, IME and UI Automation are not — see
+**Status: in use.** The verb table, DirectWrite, input and IME, GL, drag and
+drop, UI Automation and most of the shell integrations are built, and
+react-x11's examples run on them. What is not is under
 [What is missing](#what-is-missing).
 
 It exports verbs, handles and events — no policy, no widget logic, no JS canvas
@@ -103,9 +103,13 @@ Roughly by area:
 | **drawing** | 36 `ctx*` verbs on a Direct2D device context: paths, arcs, rounded rects, clips (axis-aligned and layered), gradients, shadows, images, `getImageData`/`putImageData`, `drawSurface` |
 | **text** | DirectWrite layouts with per-span formatting, line metrics, hit testing and carets; font matching, enumeration and loading; glyph runs (`fontHandle`, `fontGlyphForCodepoint`, `fontGlyphAdvances`, `ctxDrawGlyphs`); variable font axes |
 | **windows** | create, show, move, resize, title, popups, transparency, DPI, `scrollRegion`, states (maximized, minimized, fullscreen, above, focused), `windowPixels` |
-| **input** | pointer with all five buttons and capture, wheel, keyboard through `ToUnicodeEx`, activation |
+| **input** | pointer with all five buttons and capture, wheel, keyboard through `ToUnicodeEx`, activation, IME composition through IMM32 with the preedit left to the renderer |
+| **drag and drop** | an `IDropTarget` on every window that wants one and `DoDragDrop` out of one, over OLE, with the drop effect decided in JS |
+| **accessibility** | a UI Automation provider, answered from a mirror of the tree that JS pushes — so a screen reader never waits on a React commit |
 | **GL** | a WGL context and `WGL_NV_DX_interop2` onto the composed surface |
-| **the shell** | tray icon and menu, taskbar progress, overlay icon and flash, the Common Item Dialog, global hotkeys, notification balloons, `SetThreadExecutionState`, `GetLastInputInfo` |
+| **panes** | a `<Frame>` pane's pixels from another process, over a shared DirectComposition surface handle |
+| **frame pacing** | `frameClockRequest`, on `DCompositionWaitForCompositorClock` rather than a JS timer |
+| **the shell** | tray icon and menu, taskbar progress, overlay icon and flash, thumbnail toolbar, jump lists and recent documents, a per-window AppUserModelID and its relaunch properties, the Common Item Dialog, global hotkeys, notification balloons, `SetThreadExecutionState`, `GetLastInputInfo` |
 | **the desktop** | screens, system appearance, themed control bezels, clipboard, screen colour sampling |
 
 [docs/windows-integrations.md](https://github.com/sidorares/react-x11/blob/master/docs/windows-integrations.md)
@@ -114,15 +118,9 @@ the renderer's side — including the ones that are not here.
 
 ## What is missing
 
-- **drag and drop** — `IDropTarget` and `DoDragDrop` over OLE. The largest gap:
-  it works on X11 and on macOS and does nothing here.
-- **IME** — no `WM_IME_*` handling, so composition never starts and CJK input
-  does not work.
-- **UI Automation** — `WM_GETOBJECT` is unhandled, so a screen reader sees a
-  bare window.
-- **jump lists**, and the activation that would make them useful: file
-  associations, URL schemes, and a second launch that hands its arguments to
-  the first.
+- **activation** — file associations, URL schemes, and a second launch that
+  hands its arguments to the first. The jump list is here; these are what would
+  make it useful.
 - **pointer and keyboard grabs** — `SetCapture` holds only while a button is
   down, so a popup cannot be dismissed by a click outside it the way it is on
   X11.
@@ -137,6 +135,9 @@ machine, because a CI runner is not a desktop:
 | `test:unit` | nothing but the process — Direct2D, DirectWrite, the theme engine | yes, and it gates the build |
 | `test:window` | a session with a desktop to compose into | reports, does not gate |
 | `test:shell` | the notification area, the taskbar, a dialog | reports, does not gate |
+| `test:a11y` | a window, and PowerShell's UI Automation client to read it back | reports, does not gate |
+| `test:identity` | a window whose property store the shell can read | reports, does not gate |
+| `test:pane` | a desktop to compose into, and the window's pixels read back | reports, does not gate |
 | `test:gpu` | a vendor OpenGL driver | reports, does not gate |
 
 A hosted runner has no GPU: the WGL it offers is the 1.1 software rasterizer,
