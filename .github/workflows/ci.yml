@@ -28,15 +28,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: x64
-            runner: windows-latest
-            node: 20
+          # No Node 20 leg, though `engines` admits it: node-gyp 13 runs on
+          # ^22.22.2 || ^24.15.0 || >=26 and nothing older, so a Node 20 leg
+          # would be testing the build tool's refusal rather than this code.
+          # A consumer on 20 gets the prebuild — one Node-API binary for every
+          # Node — or builds with the node-gyp their own npm bundles.
           - arch: x64
             runner: windows-latest
             node: 22
           - arch: x64
             runner: windows-latest
             node: 24
+          - arch: x64
+            runner: windows-latest
+            node: 26
           # GitHub's Windows ARM64 runner. Newer than the x64 one and not on
           # every plan; `continue-on-error` below keeps a missing runner from
           # failing the branch while the x64 legs still gate it.
@@ -48,9 +53,9 @@ jobs:
             node: 24
     continue-on-error: ${{ matrix.arch == 'arm64' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
 
@@ -84,6 +89,24 @@ jobs:
         continue-on-error: true
         run: npm run test:shell
 
+      # A UI Automation client — PowerShell's, the same COM API a screen reader
+      # uses — walking a real window's tree from outside the process.
+      - name: Test (accessibility)
+        continue-on-error: true
+        run: npm run test:a11y
+
+      # The AppUserModelID and relaunch properties, read back out of the
+      # window's property store from another process, as the shell reads them.
+      - name: Test (taskbar identity)
+        continue-on-error: true
+        run: npm run test:identity
+
+      # A pane's composition surface hung in a window's visual tree, proved by
+      # reading the window's pixels back — so it needs DWM composing, as above.
+      - name: Test (panes)
+        continue-on-error: true
+        run: npm run test:pane
+
       # A vendor OpenGL driver, which no hosted runner has — the WGL a runner
       # offers is the 1.1 software rasterizer, and this test asks for a core
       # context on purpose. Run for the record, never gating.
@@ -106,14 +129,14 @@ jobs:
             runner: windows-11-arm
     continue-on-error: ${{ matrix.arch == 'arm64' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - run: npm ci
       - run: npm run build:prebuild
       - run: node scripts/check-arch.js
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: prebuild-win32-${{ matrix.arch }}
           path: prebuilds/win32-${{ matrix.arch }}/win32.node
