@@ -729,6 +729,36 @@ std::wstring CurrentAppId() {
   return g_appId;
 }
 
+/** A window's property store, or null. The caller releases it. */
+IPropertyStore* OpenWindowStore(HWND hwnd) {
+  IPropertyStore* store = nullptr;
+  if (FAILED(::SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&store)))) {
+    return nullptr;
+  }
+  return store;
+}
+
+/**
+ * One string property, or its absence.
+ *
+ * `clearing` writes VT_EMPTY, which is how a property store says "no value" —
+ * what puts a window back on the shell's own answer rather than leaving it on
+ * a stale one. `Commit` is the caller's, so a set of properties lands as one.
+ */
+void WriteString(IPropertyStore* store, const PROPERTYKEY& key,
+                 const std::wstring& text, bool clearing) {
+  PROPVARIANT value;
+  ::PropVariantInit(&value);
+  HRESULT hr = S_OK;
+  if (clearing) {
+    value.vt = VT_EMPTY;
+  } else {
+    hr = ::InitPropVariantFromString(text.c_str(), &value);
+  }
+  if (SUCCEEDED(hr)) store->SetValue(key, value);
+  ::PropVariantClear(&value);
+}
+
 // windowAppId(windowId, id) -> boolean
 //
 // `id` is a string of up to 128 characters with no spaces — Microsoft's rule,
@@ -754,23 +784,79 @@ Napi::Value WindowAppId(const Napi::CallbackInfo& info) {
   PostToUiThread([windowId, id, clearing]() {
     HWND hwnd = WindowHwnd(windowId);
     if (!hwnd) return;
-    IPropertyStore* store = nullptr;
-    if (FAILED(::SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&store)))) {
-      return;
+    IPropertyStore* store = OpenWindowStore(hwnd);
+    if (!store) return;
+    WriteString(store, PKEY_AppUserModel_ID, id, clearing);
+    store->Commit();
+    store->Release();
+  });
+  return Napi::Boolean::New(env, true);
+}
+
+// windowRelaunch(windowId, { command, displayName, icon }) -> boolean
+//
+// What a **pinned** tile starts, and what it is called while it is pinned.
+//
+// An AppUserModelID alone is half the story: it makes the taskbar group this
+// window under an identity of its own, and then a user who pins that button
+// gets a shortcut to whatever the shell can work out on its own — for
+// `node app.js` that is node.exe, with node's icon and node's name. The
+// relaunch properties are the other half, and Microsoft's guidance is that an
+// application setting the id should set them too.
+//
+// Each field is independent and each `null` clears only its own, so a caller
+// that wants the shell's own guess for the icon can say nothing about it.
+Napi::Value WindowRelaunch(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const int windowId = info[0].As<Napi::Number>().Int32Value();
+  Napi::Object spec = info.Length() > 1 && info[1].IsObject()
+                          ? info[1].As<Napi::Object>()
+                          : Napi::Object::New(env);
+
+  struct Field {
+    std::wstring value;
+    bool clearing = true;
+  };
+  // `Given` is not the test here: it answers false for null, and null is the
+  // one value that *means* something — clear this property. So presence and
+  // emptiness are asked separately, with JS's own convention between them:
+  // a key that is absent or `undefined` is left alone, and `null` clears.
+  const auto said = [&](const char* key) {
+    return spec.Has(key) && !spec.Get(key).IsUndefined();
+  };
+  const auto read = [&](const char* key) {
+    Field field;
+    if (!said(key)) return field;
+    Napi::Value v = spec.Get(key);
+    field.clearing = v.IsNull();
+    if (!field.clearing) field.value = Wide(v);
+    return field;
+  };
+  const bool hasCommand = said("command");
+  const bool hasName = said("displayName");
+  const bool hasIcon = said("icon");
+  const Field command = read("command");
+  const Field name = read("displayName");
+  const Field icon = read("icon");
+
+  PostToUiThread([windowId, command, name, icon, hasCommand, hasName, hasIcon]() {
+    HWND hwnd = WindowHwnd(windowId);
+    if (!hwnd) return;
+    IPropertyStore* store = OpenWindowStore(hwnd);
+    if (!store) return;
+    if (hasCommand) {
+      WriteString(store, PKEY_AppUserModel_RelaunchCommand, command.value,
+                  command.clearing);
     }
-    PROPVARIANT value;
-    ::PropVariantInit(&value);
-    HRESULT hr = S_OK;
-    if (clearing) {
-      // VT_EMPTY is how a property store says "no value", which is what puts
-      // the window back on the process's id rather than on a stale one.
-      value.vt = VT_EMPTY;
-    } else {
-      hr = ::InitPropVariantFromString(id.c_str(), &value);
+    if (hasName) {
+      WriteString(store, PKEY_AppUserModel_RelaunchDisplayNameResource,
+                  name.value, name.clearing);
     }
-    if (SUCCEEDED(hr)) hr = store->SetValue(PKEY_AppUserModel_ID, value);
-    if (SUCCEEDED(hr)) store->Commit();
-    ::PropVariantClear(&value);
+    if (hasIcon) {
+      WriteString(store, PKEY_AppUserModel_RelaunchIconResource, icon.value,
+                  icon.clearing);
+    }
+    store->Commit();
     store->Release();
   });
   return Napi::Boolean::New(env, true);
@@ -1143,4 +1229,5 @@ void InitShellExports(Napi::Env env, Napi::Object exports) {
   set("recentDocument", RecentDocument);
   set("jumpList", JumpList);
   set("windowAppId", WindowAppId);
+  set("windowRelaunch", WindowRelaunch);
 }

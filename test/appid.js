@@ -41,8 +41,10 @@ const waitFor = (type, ms = 4000) =>
     }, 20);
   });
 
-/** PKEY_AppUserModel_ID off a live window, or a reason it is not there. */
-function readAppId(hwnd) {
+/** One of the AppUserModel properties off a live window, by its `pid` in the
+ *  shared format id: 5 is the ID, 2 the RelaunchCommand, 4 the
+ *  RelaunchDisplayNameResource, 3 the RelaunchIconResource. */
+function readProp(hwnd, pid) {
   const script = `
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
@@ -63,13 +65,13 @@ public static class R {
   [DllImport("shell32.dll")] static extern int SHGetPropertyStoreForWindow(
     IntPtr h, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out IPS s);
   [DllImport("ole32.dll")] static extern int PropVariantClear(IntPtr pv);
-  public static string Read(IntPtr h) {
+  public static string Read(IntPtr h, int pid) {
     Guid iid = new Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99");
     IPS s; int hr = SHGetPropertyStoreForWindow(h, ref iid, out s);
     if (hr != 0) return "ERROR store 0x" + hr.ToString("X");
     PK k = new PK();
     k.fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
-    k.pid = 5;
+    k.pid = (uint)pid;
     IntPtr pv = Marshal.AllocCoTaskMem(24);
     try {
       for (int i = 0; i < 24; i++) Marshal.WriteByte(pv, i, 0);
@@ -86,9 +88,9 @@ public static class R {
   }
 }
 '@
-[R]::Read([IntPtr]${hwnd})
+[R]::Read([IntPtr]${hwnd}, ${pid})
 `;
-  const file = path.join(os.tmpdir(), `appid-${process.pid}.ps1`);
+  const file = path.join(os.tmpdir(), `appid-${process.pid}-${pid}.ps1`);
   fs.writeFileSync(file, script, 'utf8');
   try {
     return execFileSync(
@@ -119,12 +121,12 @@ async function main() {
 
   // Before anything is set there is no override, and the window is on the
   // process's identity — node.exe's, which is the grouping this exists to fix.
-  assert.equal(readAppId(hwnd), '<none>', 'a window started out with an id');
+  assert.equal(readProp(hwnd, 5), '<none>', 'a window started out with an id');
 
   win32.windowAppId(id, 'com.example.BridgeTest');
   await sleep(250);
   assert.equal(
-    readAppId(hwnd),
+    readProp(hwnd, 5),
     'com.example.BridgeTest',
     'the id never reached the property store',
   );
@@ -134,13 +136,13 @@ async function main() {
   // second window with one of its own.
   win32.windowAppId(id, 'com.example.Other');
   await sleep(250);
-  assert.equal(readAppId(hwnd), 'com.example.Other');
+  assert.equal(readProp(hwnd, 5), 'com.example.Other');
 
   // `null` clears the override rather than leaving a stale one behind.
   win32.windowAppId(id, null);
   await sleep(250);
   assert.equal(
-    readAppId(hwnd),
+    readProp(hwnd, 5),
     '<none>',
     'clearing left the window on an identity it no longer claims',
   );
@@ -159,6 +161,38 @@ async function main() {
     'the UI thread died on a destroyed window',
   );
   console.log('appid     : survived a set on a destroyed window');
+
+  // --- the relaunch properties ---------------------------------------------
+  //
+  // The other half of an identity: an id makes the taskbar group this window
+  // on its own, and these decide what a user who *pins* that button gets. An
+  // id without them pins whatever the shell can work out by itself, which for
+  // `node app.js` is node.exe under node's name and icon.
+  const secondHwnd = win32.windowHandle(second);
+  win32.windowAppId(second, 'com.example.Pinned');
+  win32.windowRelaunch(second, {
+    command: '"C:/app/app.exe" --from-pin',
+    displayName: 'Pinned App',
+    icon: 'C:/app/app.exe,0',
+  });
+  await sleep(300);
+  assert.equal(readProp(secondHwnd, 2), '"C:/app/app.exe" --from-pin', 'command');
+  assert.equal(readProp(secondHwnd, 4), 'Pinned App', 'display name');
+  assert.equal(readProp(secondHwnd, 3), 'C:/app/app.exe,0', 'icon');
+  console.log('relaunch  : command, name and icon all read back');
+
+  // A field left out is left alone; a field set to null is cleared. That is
+  // what lets a caller take the shell's own answer for the icon and name its
+  // own command.
+  win32.windowRelaunch(second, { displayName: null });
+  await sleep(250);
+  assert.equal(readProp(secondHwnd, 4), '<none>', 'the name did not clear');
+  assert.equal(
+    readProp(secondHwnd, 2),
+    '"C:/app/app.exe" --from-pin',
+    'clearing one property took another with it',
+  );
+  console.log('relaunch  : one field clears without disturbing the others');
 
   win32.destroyWindow(second);
   console.log('\nok');
