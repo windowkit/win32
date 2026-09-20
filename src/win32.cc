@@ -75,6 +75,12 @@ struct Window {
   // `<window transparent>`: the app draws its own shape and the rest shows
   // through. Together with `popup` this decides the surface's alpha mode.
   bool transparent = false;
+  // `<popup dragPreview>`: a window that follows the pointer during a drag,
+  // and therefore sits **under** it. A window under the pointer is the window
+  // the shell finds when it looks for somewhere to drop, so unless this one
+  // is transparent to hit testing it answers that question itself — and it is
+  // not a drop target, so the answer is "nowhere". See WM_NCHITTEST below.
+  bool clickThrough = false;
   // Windows has no fullscreen state: it is the decorations taken off and the
   // window sized to the monitor. What it was before that is kept here, because
   // recomputing it from a default would lose whatever the window actually was.
@@ -288,6 +294,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       Emit(Event{"resize", window->id, static_cast<double>(LOWORD(lparam)),
                  static_cast<double>(HIWORD(lparam))});
       return 0;
+    // "There is nothing here; ask what is behind me." The documented way for
+    // a window to take itself out of hit testing, and what makes the shell's
+    // search for a drop target walk past a `<popup dragPreview>` to the list
+    // underneath it. Cocoa spells the same thing `ignoresMouseEvents`
+    // (src/cocoa/window.js).
+    case WM_NCHITTEST:
+      if (window && window->clickThrough) return HTTRANSPARENT;
+      break;
+
     case WM_MOUSEMOVE: {
       // Windows sends no "the pointer left" message unless it is asked, once,
       // per entry. Without it a control keeps its :hover after the pointer has
@@ -715,6 +730,8 @@ Napi::Value CreateWindowExport(const Napi::CallbackInfo& info) {
   const bool popup = given("popup") && options.Get("popup").ToBoolean().Value();
   const bool transparent =
       given("transparent") && options.Get("transparent").ToBoolean().Value();
+  const bool clickThrough =
+      given("clickThrough") && options.Get("clickThrough").ToBoolean().Value();
 
   Window* window = new Window();
   {
@@ -724,15 +741,21 @@ Napi::Value CreateWindowExport(const Napi::CallbackInfo& info) {
     window->height = static_cast<UINT>(height);
     window->popup = popup;
     window->transparent = transparent;
+    window->clickThrough = clickThrough;
     g_windows[window->id] = window;
   }
 
-  PostCommand([window, title, width, height, x, y, placed, popup]() {
+  PostCommand([window, title, width, height, x, y, placed, popup, clickThrough]() {
     const DWORD style = popup ? WS_POPUP : WS_OVERLAPPEDWINDOW;
     // No redirection bitmap: the window's pixels come from DirectComposition,
     // and GDI never has a surface of its own to show.
     DWORD exStyle = WS_EX_NOREDIRECTIONBITMAP;
     if (popup) exStyle |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+    // Mouse messages fall through to whatever is beneath. Not sufficient on
+    // its own for the shell's drop-target search, which is why WM_NCHITTEST
+    // answers too — but it is what keeps the preview from swallowing an
+    // ordinary click as well.
+    if (clickThrough) exStyle |= WS_EX_TRANSPARENT;
 
     // The caller's width and height are the *client* area, as an X window's
     // are. A framed window is grown to fit its frame around that; a WS_POPUP
