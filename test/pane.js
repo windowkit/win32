@@ -126,6 +126,85 @@ async function main() {
   await sleep(300);
   console.log('pane      : resized and redrew while attached');
 
+  // …and it is still only as big as the *rect*, though it drew 260x150 into
+  // a 200x120 slot. The two sides disagree about a pane's size for as long
+  // as a round trip takes, and every shrink of a `<Frame>`'s box is one of
+  // those; without the visual's clip the frames in between paint over
+  // whatever the app put beside the pane.
+  const clipped = count(win32.windowPixels(win, 0, 0, W, H), W, H, [38, 204, 102]);
+  assert.ok(
+    clipped <= PANE_W * PANE_H * 1.02,
+    `the pane painted past its rect (${clipped} > ${PANE_W * PANE_H})`,
+  );
+  assert.ok(clipped > (PANE_W * PANE_H) / 2, 'the clip ate the pane whole');
+  console.log(`host      : held to its rect while oversized (${clipped})`);
+
+  // Told the bigger rect, the rest of it appears — which is what says the
+  // clip was doing the bounding, and not some other limit.
+  win32.paneSetRect(view, 40, 60, 260, 150);
+  await sleep(300);
+  const grown = count(win32.windowPixels(win, 0, 0, W, H), W, H, [38, 204, 102]);
+  assert.ok(
+    grown > PANE_W * PANE_H * 1.3,
+    `the pane did not grow into its new rect (${grown} vs ${clipped})`,
+  );
+  console.log(`host      : grew into a bigger rect (${grown})`);
+
+  // --- how stale is the back buffer? ---------------------------------------
+  //
+  // A flip chain hands `GetBuffer(0)` back a *recycled* buffer, not a
+  // persistent bitmap, so a pane that repaints only its damage leaves the
+  // rest of itself showing some earlier frame. Which earlier frame is the
+  // whole basis of the damage accumulation in react-x11's
+  // src/win32/panewindow.js (`STALE_FRAMES`), and nothing in the API says
+  // it — so it is measured here, and a chain that ever got deeper would
+  // fail here rather than ghosting in somebody's app.
+  const generations = [
+    [1, 0.2, 0.2],
+    [0.2, 1, 0.2],
+    [0.2, 0.2, 1],
+    [1, 1, 0.2],
+  ];
+  for (const [r, g, b] of generations) {
+    const gen = win32.paneBeginDraw(pane.id);
+    win32.ctxSetFillColor(gen, r, g, b, 1);
+    win32.ctxFillRect(gen, 0, 0, 260, 150);
+    win32.paneEndDraw(pane.id);
+    await sleep(80);
+  }
+  // A frame that touches one corner and nothing else.
+  const partial = win32.paneBeginDraw(pane.id);
+  win32.ctxSetFillColor(partial, 1, 1, 1, 1);
+  win32.ctxFillRect(partial, 0, 0, 40, 40);
+  win32.paneEndDraw(pane.id);
+  await sleep(350);
+
+  const probe = win32.windowPixels(win, 0, 0, W, H);
+  const at = (x, y) => {
+    const i = ((60 + y) * W + (40 + x)) * 4;
+    return [probe[i], probe[i + 1], probe[i + 2]];
+  };
+  const near = (a, b) => a.every((v, i) => Math.abs(v - b[i]) <= 26);
+  assert.ok(near(at(20, 20), [255, 255, 255]), 'the partial frame never landed');
+  const untouched = at(200, 120);
+  const behind = generations.findIndex(([r, g, b]) =>
+    near(untouched, [r * 255, g * 255, b * 255]),
+  );
+  assert.notEqual(
+    behind,
+    -1,
+    `the untouched part of the pane is no frame we drew (${untouched})`,
+  );
+  // generations[2] is the 3rd of 5 presents: two behind.
+  const stale = generations.length + 1 - (behind + 1);
+  assert.equal(
+    stale,
+    2,
+    `the back buffer is ${stale} frames behind, not 2 — ` +
+      "react-x11's STALE_FRAMES no longer covers it",
+  );
+  console.log(`pane      : a partial frame sits on one ${stale} frames old`);
+
   win32.paneDetach(view);
   win32.paneDestroy(pane.id);
   await sleep(250);

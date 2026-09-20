@@ -311,10 +311,13 @@ Napi::Value PaneAttach(const Napi::CallbackInfo& info) {
 
 // paneSetRect(viewId, x, y, width, height) -> undefined
 //
-// Only the offset: the pane draws at its own size and the host tells it that
-// size over the frame channel, so there is nothing to scale here. A visual
-// placed but not yet resized shows the pane's last frame in the right corner,
-// which is the right way round for a pane that is still catching up.
+// The offset places the pane; the size **clips** it, and does not scale it.
+// The pane draws at whatever size it was last told over the frame channel, so
+// the two sides disagree for as long as a round trip takes — and a host box
+// that just shrank is exactly when they do. Without the clip those frames
+// paint outside the box the layout gave them, over whatever the app put
+// beside the pane; with it the pane is short of its corner for a frame or
+// two instead, which is the right way round for something still catching up.
 Napi::Value PaneSetRect(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto found = g_views.find(info[0].As<Napi::Number>().Int32Value());
@@ -322,6 +325,18 @@ Napi::Value PaneSetRect(const Napi::CallbackInfo& info) {
   PaneView* view = found->second;
   view->visual->SetOffsetX(static_cast<float>(info[1].As<Napi::Number>().DoubleValue()));
   view->visual->SetOffsetY(static_cast<float>(info[2].As<Napi::Number>().DoubleValue()));
+  // In the visual's own space, which the offset above has already
+  // established — so the clip is the pane's rect at its own origin, not the
+  // host-relative one, and it does not have to be re-derived when the pane
+  // moves. test/pane.js holds it to that with a pane deliberately bigger
+  // than its rect: every pixel past the clip has to be the host's own.
+  if (info.Length() > 4) {
+    const float width = static_cast<float>(info[3].As<Napi::Number>().DoubleValue());
+    const float height = static_cast<float>(info[4].As<Napi::Number>().DoubleValue());
+    if (width > 0 && height > 0) {
+      view->visual->SetClip(D2D1::RectF(0, 0, width, height));
+    }
+  }
   if (g_dcomp) g_dcomp->Commit();
   return env.Undefined();
 }
