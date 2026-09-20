@@ -43,6 +43,11 @@ You need an `@windowkit` scope on npm and push access to the repository.
    `npm run build:prebuild` files the host's binary and nothing else, so a
    release packed that way is missing an architecture.
 
+   Either way, replace whatever is in `prebuilds/` rather than trusting it. A
+   working copy never loads its own prebuild — `index.js` prefers `build/` —
+   so one left over from an earlier build passes every local test and is still
+   what `npm publish` packs.
+
 2. **Check what the tarball would contain.**
 
    ```bash
@@ -82,6 +87,17 @@ You need an `@windowkit` scope on npm and push access to the repository.
    ```
 
    Set it to whatever you published, commit, push.
+
+   Then tag the commit that was published. The manifest says *which* version
+   is out; only a tag says *where* it is:
+
+   ```bash
+   git tag v0.0.1 <sha>
+   git push origin v0.0.1
+   ```
+
+   Without the tag release-please finds no boundary, and the first changelog it
+   writes credits the next release with every commit since the scaffold.
 
 ## Every release after that
 
