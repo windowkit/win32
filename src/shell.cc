@@ -15,6 +15,8 @@
 #include "bridge.h"
 
 #include <commctrl.h>
+#include <mutex>
+
 #include <propkey.h>
 #include <propvarutil.h>
 #include <shellapi.h>
@@ -700,6 +702,80 @@ bool HandleTaskbarMessage(int windowId, UINT message, WPARAM wparam) {
 
 namespace {
 
+// --- the application's identity -------------------------------------------
+//
+// The AppUserModelID is what Windows means by "which application is this":
+// the taskbar groups buttons by it, pinning pins it, a jump list belongs to
+// it, and a toast is attributed to it. It is the same job X11 gives WM_CLASS
+// and Wayland gives xdg_toplevel.set_app_id, which is why `<window appId>`
+// is one prop across the three (react-x11 src/types/elements.d.ts).
+//
+// Set **per window**, through the window's property store, rather than
+// per process: `SetCurrentProcessExplicitAppUserModelID` must be called
+// before the process creates any UI, and a library cannot promise that of an
+// embedder. A window's own id overrides the process's for every purpose the
+// shell uses it for, so the per-window form is both the more flexible and the
+// only one this can guarantee.
+//
+// The last id any window was given is remembered so the jump list can name
+// the same one (`SetAppID` in `JumpList`) — a list attached to node.exe's
+// identity appears on the wrong taskbar button, which is to say on none of
+// this application's.
+std::mutex g_appIdMutex;
+std::wstring g_appId;
+
+std::wstring CurrentAppId() {
+  std::lock_guard<std::mutex> lock(g_appIdMutex);
+  return g_appId;
+}
+
+// windowAppId(windowId, id) -> boolean
+//
+// `id` is a string of up to 128 characters with no spaces — Microsoft's rule,
+// and unenforced here because the shell simply ignores one it dislikes and
+// this reports what happened rather than guessing ahead of it. `null` clears
+// the override and puts the window back on the process's identity.
+//
+// **Set it before the window is shown.** The taskbar reads the property when
+// the button is created, so an id arriving later leaves that button grouped
+// where it already was; src/win32/window.js sets it from `_onReady`, which
+// runs after the HWND exists and before `show`.
+Napi::Value WindowAppId(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const int windowId = info[0].As<Napi::Number>().Int32Value();
+  const bool clearing = info[1].IsNull() || info[1].IsUndefined();
+  const std::wstring id = clearing ? std::wstring() : Wide(info[1]);
+
+  {
+    std::lock_guard<std::mutex> lock(g_appIdMutex);
+    g_appId = id;
+  }
+
+  PostToUiThread([windowId, id, clearing]() {
+    HWND hwnd = WindowHwnd(windowId);
+    if (!hwnd) return;
+    IPropertyStore* store = nullptr;
+    if (FAILED(::SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&store)))) {
+      return;
+    }
+    PROPVARIANT value;
+    ::PropVariantInit(&value);
+    HRESULT hr = S_OK;
+    if (clearing) {
+      // VT_EMPTY is how a property store says "no value", which is what puts
+      // the window back on the process's id rather than on a stale one.
+      value.vt = VT_EMPTY;
+    } else {
+      hr = ::InitPropVariantFromString(id.c_str(), &value);
+    }
+    if (SUCCEEDED(hr)) hr = store->SetValue(PKEY_AppUserModel_ID, value);
+    if (SUCCEEDED(hr)) store->Commit();
+    ::PropVariantClear(&value);
+    store->Release();
+  });
+  return Napi::Boolean::New(env, true);
+}
+
 // recentDocument(path) — the Recent list in the jump list and in Explorer's
 // quick access. One call, and the shell decides where it shows: this is the
 // same act as macOS's `noteNewRecentDocumentURL:`.
@@ -747,12 +823,18 @@ Napi::Value JumpList(const Napi::CallbackInfo& info) {
     if (!task.title.empty()) tasks.push_back(std::move(task));
   }
 
-  PostToUiThread([tasks]() {
+  const std::wstring identity = CurrentAppId();
+  PostToUiThread([tasks, identity]() {
     ICustomDestinationList* destinations = nullptr;
     if (FAILED(::CoCreateInstance(CLSID_DestinationList, nullptr, CLSCTX_INPROC_SERVER,
                                   IID_PPV_ARGS(&destinations)))) {
       return;
     }
+    // The list belongs to an identity, and by default that is the process's
+    // — which for `node app.js` is node.exe, where the user's other Node
+    // programs' lists also are. Naming the same id the windows carry is what
+    // puts the list on *this* application's taskbar button.
+    if (!identity.empty()) destinations->SetAppID(identity.c_str());
     UINT slots = 0;
     IObjectArray* removed = nullptr;
     if (FAILED(destinations->BeginList(&slots, IID_PPV_ARGS(&removed)))) {
@@ -1060,4 +1142,5 @@ void InitShellExports(Napi::Env env, Napi::Object exports) {
   set("thumbnailToolbar", ThumbnailToolbar);
   set("recentDocument", RecentDocument);
   set("jumpList", JumpList);
+  set("windowAppId", WindowAppId);
 }
