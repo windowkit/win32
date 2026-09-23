@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.4](https://github.com/windowkit/win32/compare/v0.0.3...v0.0.4) (2026-09-23)
+
+
+### Features
+
+* **text:** layoutCoverage — a layout's coverage without a surface ([#6](https://github.com/windowkit/win32/issues/6)) ([89fe937](https://github.com/windowkit/win32/commit/89fe93776bd62dbffb9c992a8e9417fd2f047de5))
+
 ## [0.0.3](https://github.com/windowkit/win32/compare/v0.0.2...v0.0.3) (2026-09-23)
 
 
