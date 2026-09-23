@@ -78,6 +78,33 @@ struct UiaTree {
 std::mutex g_uiaMutex;
 std::map<int, UiaTree> g_trees;
 
+// When a client last read each window's tree, from GetTickCount64 — the
+// per-window answer to "is anybody using this", which UiaClientsAreListening
+// cannot give: that one is true whenever *any* client on the desktop is
+// subscribed to *anything*, and on a Windows with the touch keyboard or the
+// text services running it always is. Written from UIA's threads under
+// `g_uiaMutex`; read by `uiaActive`.
+std::map<int, ULONGLONG> g_lastQuery;
+
+// How long a window stays in use after a client's last read. A read after
+// longer than this is a client coming back to a mirror JS stopped keeping
+// current, and asks for a fresh one (`uia-wanted`).
+constexpr ULONGLONG kQueryIdleMs = 5000;
+
+/** A client read this window's tree. Posts `uia-wanted` when it is the
+ *  first read after an idle spell. Never waits on JS. */
+void NoteQuery(int windowId) {
+  const ULONGLONG now = ::GetTickCount64();
+  bool woke = false;
+  {
+    std::lock_guard<std::mutex> lock(g_uiaMutex);
+    ULONGLONG& last = g_lastQuery[windowId];
+    woke = last == 0 || now - last > kQueryIdleMs;
+    last = now;
+  }
+  if (woke) EmitEvent("uia-wanted", windowId);
+}
+
 /**
  * `WINDOWKIT_TRACE_UIA=1` reports every call UIA makes, as ordinary bridge
  * events.
@@ -171,6 +198,7 @@ class NodeProvider : public IRawElementProviderSimple,
 
   HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID pattern,
                                                IUnknown** out) override {
+    NoteQuery(windowId_);
     *out = nullptr;
     UiaNodeData node;
     {
@@ -190,6 +218,7 @@ class NodeProvider : public IRawElementProviderSimple,
 
   HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID property,
                                              VARIANT* out) override {
+    NoteQuery(windowId_);
     ::VariantInit(out);
     if (Tracing()) {
       EmitEvent("uia-trace", windowId_, 200 + static_cast<double>(property),
@@ -256,6 +285,7 @@ class NodeProvider : public IRawElementProviderSimple,
 
   HRESULT STDMETHODCALLTYPE Navigate(NavigateDirection direction,
                                      IRawElementProviderFragment** out) override {
+    NoteQuery(windowId_);
     *out = nullptr;
     int64_t wanted = 0;
     if (Tracing()) {
@@ -322,6 +352,7 @@ class NodeProvider : public IRawElementProviderSimple,
   }
 
   HRESULT STDMETHODCALLTYPE get_BoundingRectangle(UiaRect* out) override {
+    NoteQuery(windowId_);
     *out = {0, 0, 0, 0};
     UiaNodeData node;
     std::lock_guard<std::mutex> lock(g_uiaMutex);
@@ -398,6 +429,7 @@ class NodeProvider : public IRawElementProviderSimple,
   }
 
   HRESULT STDMETHODCALLTYPE GetFocus(IRawElementProviderFragment** out) override {
+    NoteQuery(windowId_);
     *out = nullptr;
     int64_t focused = 0;
     {
@@ -605,6 +637,10 @@ bool HandleUiaMessage(int windowId, HWND hwnd, UINT message, WPARAM wparam,
   // an idle application does not read whatever the mirror happened to hold
   // from the last commit.
   EmitEvent("uia-wanted", windowId);
+  {
+    std::lock_guard<std::mutex> lock(g_uiaMutex);
+    g_lastQuery[windowId] = ::GetTickCount64();
+  }
 
   int64_t root = 0;
   {
@@ -626,6 +662,7 @@ bool HandleUiaMessage(int windowId, HWND hwnd, UINT message, WPARAM wparam,
 void UiaWindowGone(int windowId) {
   std::lock_guard<std::mutex> lock(g_uiaMutex);
   g_trees.erase(windowId);
+  g_lastQuery.erase(windowId);
 }
 
 void InitUiaExports(Napi::Env env, Napi::Object exports) {
@@ -638,6 +675,26 @@ void InitUiaExports(Napi::Env env, Napi::Object exports) {
               Napi::Function::New(env, [](const Napi::CallbackInfo& info) {
                 return Napi::Boolean::New(info.Env(),
                                           ::UiaClientsAreListening() != FALSE);
+              }));
+
+  // uiaActive(windowId) -> boolean
+  //
+  // Whether a client has read this window's tree in the last few seconds —
+  // the question the JS half actually has before it walks the tree on a
+  // commit. False for a window no client has ever asked about, which is
+  // every window on a machine with no screen reader, whatever
+  // UiaClientsAreListening says. A client that comes back after an idle
+  // spell is noticed on its first read (`uia-wanted`), so a mirror nobody
+  // is keeping current is brought up to date before the client's next look.
+  exports.Set("uiaActive",
+              Napi::Function::New(env, [](const Napi::CallbackInfo& info) {
+                const int windowId = info[0].As<Napi::Number>().Int32Value();
+                std::lock_guard<std::mutex> lock(g_uiaMutex);
+                auto found = g_lastQuery.find(windowId);
+                const bool active =
+                    found != g_lastQuery.end() &&
+                    ::GetTickCount64() - found->second <= kQueryIdleMs;
+                return Napi::Boolean::New(info.Env(), active);
               }));
 
   // uiaUpdate(windowId, { root, focused, nodes: [...], removed: [...] })
