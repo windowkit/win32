@@ -36,7 +36,7 @@
     "test:shell": "node test/shell.js",
     "test:a11y": "node test/uia.js",
     "test:identity": "node test/appid.js",
-    "test:pane": "node test/pane.js",
+    "test:pane": "node test/pane.js && node test/layer.js",
     "test:gpu": "node test/gl.js",
     "demo": "node examples/window.js",
     "check:arch": "node scripts/check-arch.js"

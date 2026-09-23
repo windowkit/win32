@@ -160,3 +160,8 @@ void InitPaneExports(Napi::Env env, Napi::Object exports);
 void InitFrameClockExports(Napi::Env env, Napi::Object exports);
 void StopFrameClock();
 void InitGlContextExports(Napi::Env env, Napi::Object exports);
+
+// Layers: a visual with a premultiplied surface of its own, above every
+// swap chain in a window's tree — what react-x11 draws a `<glarea>`'s
+// children on (src/layer.cc).
+void InitLayerExports(Napi::Env env, Napi::Object exports);

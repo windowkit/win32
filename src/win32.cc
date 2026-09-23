@@ -1430,6 +1430,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitPaneExports(env, exports);
   InitFrameClockExports(env, exports);
   InitGlContextExports(env, exports);
+  InitLayerExports(env, exports);
   return exports;
 }
 
