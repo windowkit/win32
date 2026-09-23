@@ -1,6 +1,6 @@
 {
   "name": "@windowkit/win32",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Mechanism-only Win32 bridge for Node.js: HWNDs on a UI thread of their own, DirectComposition surfaces, a Direct2D verb table and DirectWrite text — the Windows half of react-x11.",
   "main": "index.js",
   "os": [
