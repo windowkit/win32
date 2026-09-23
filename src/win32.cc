@@ -870,6 +870,19 @@ Napi::Value WindowPixels(const Napi::CallbackInfo& info) {
   Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
   if (!window || !window->hwnd) return env.Null();
 
+  // Asked in device pixels. This thread is not DPI aware, and a thread that
+  // is not is answered in scaled-down virtual pixels: on a 125% display the
+  // client rect came back 80% of its size, and PrintWindow — which draws at
+  // the window's real size whoever asks — filled that much of it, so a
+  // capture was the top-left four fifths of the window, cropped. Set for
+  // the length of the call, as listScreens does.
+  const DPI_AWARENESS_CONTEXT previousAwareness =
+      ::SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  struct RestoreAwareness {
+    DPI_AWARENESS_CONTEXT previous;
+    ~RestoreAwareness() { ::SetThreadDpiAwarenessContext(previous); }
+  } restoreAwareness{previousAwareness};
+
   RECT client = {};
   ::GetClientRect(window->hwnd, &client);
   const int fullWidth = client.right - client.left;
