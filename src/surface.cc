@@ -10,6 +10,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -128,17 +131,74 @@ void SyncTransform(Surface* surface) {
   if (surface->dc) surface->dc->SetTransform(surface->state.transform);
 }
 
+// Brushes and stroke styles, kept. Making one per draw was most of what a
+// small fill cost: a card's fill and its border were a COM object each,
+// created and released around a primitive the GPU draws in no time. Both
+// are device resources of the one Direct2D device every context here comes
+// from (a window's BeginDraw, a layer's, an offscreen surface), so one
+// cache serves them all. Handed out with a reference of the caller's own,
+// which is what keeps every `Release()` after a draw correct.
+//
+// Keyed by colour rather than kept as one brush that is re-coloured: a
+// brush a batched draw still refers to cannot change colour under it, and
+// Direct2D would flush the batch to let it.
+namespace {
+
+constexpr size_t kMaxBrushes = 512;
+constexpr size_t kMaxStrokeStyles = 64;
+std::unordered_map<uint64_t, ID2D1SolidColorBrush*> g_brushes;
+std::map<std::vector<float>, ID2D1StrokeStyle1*> g_strokeStyles;
+
+uint64_t ColorKey(const D2D1_COLOR_F& c) {
+  const auto q = [](float v) -> uint64_t {
+    const float clamped = v < 0 ? 0.0f : (v > 1 ? 1.0f : v);
+    return static_cast<uint64_t>(clamped * 65535.0f + 0.5f);
+  };
+  return (q(c.r) << 48) | (q(c.g) << 32) | (q(c.b) << 16) | q(c.a);
+}
+
+}  // namespace
+
 ID2D1SolidColorBrush* MakeBrush(Surface* surface, const D2D1_COLOR_F& color) {
   if (!surface->dc) return nullptr;
   D2D1_COLOR_F c = color;
   c.a *= surface->state.globalAlpha;
+  const uint64_t key = ColorKey(c);
+  auto found = g_brushes.find(key);
+  if (found != g_brushes.end()) {
+    found->second->AddRef();
+    return found->second;
+  }
   ID2D1SolidColorBrush* brush = nullptr;
   surface->dc->CreateSolidColorBrush(c, &brush);
+  if (!brush) return nullptr;
+  if (g_brushes.size() >= kMaxBrushes) {
+    // a palette this big is a gradient drawn a colour at a time; start over
+    for (auto& entry : g_brushes) entry.second->Release();
+    g_brushes.clear();
+  }
+  brush->AddRef();
+  g_brushes[key] = brush;
   return brush;
 }
 
 ID2D1StrokeStyle1* MakeStrokeStyle(Surface* surface) {
   const GState& s = surface->state;
+  // Direct2D's dash lengths are multiples of the stroke width, where canvas
+  // states them in pixels.
+  std::vector<float> dashes;
+  const float unit = s.lineWidth > 0 ? s.lineWidth : 1.0f;
+  for (float d : s.dash) dashes.push_back(d / unit);
+
+  std::vector<float> key = {static_cast<float>(s.cap), static_cast<float>(s.join),
+                            s.dashOffset};
+  key.insert(key.end(), dashes.begin(), dashes.end());
+  auto found = g_strokeStyles.find(key);
+  if (found != g_strokeStyles.end()) {
+    found->second->AddRef();
+    return found->second;
+  }
+
   D2D1_STROKE_STYLE_PROPERTIES1 props = {};
   props.startCap = s.cap;
   props.endCap = s.cap;
@@ -156,16 +216,18 @@ ID2D1StrokeStyle1* MakeStrokeStyle(Surface* surface) {
   factory->Release();
   if (!factory1) return nullptr;
 
-  // Direct2D's dash lengths are multiples of the stroke width, where canvas
-  // states them in pixels.
-  std::vector<float> dashes;
-  const float unit = s.lineWidth > 0 ? s.lineWidth : 1.0f;
-  for (float d : s.dash) dashes.push_back(d / unit);
-
   ID2D1StrokeStyle1* style = nullptr;
   factory1->CreateStrokeStyle(props, dashes.empty() ? nullptr : dashes.data(),
                               static_cast<UINT32>(dashes.size()), &style);
   factory1->Release();
+  if (!style) return nullptr;
+  if (g_strokeStyles.size() >= kMaxStrokeStyles) {
+    // a dash that marches is a new offset every frame; start over
+    for (auto& entry : g_strokeStyles) entry.second->Release();
+    g_strokeStyles.clear();
+  }
+  style->AddRef();
+  g_strokeStyles[key] = style;
   return style;
 }
 
@@ -562,12 +624,152 @@ Napi::Value CtxClosePath(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// ctxPath(surface, Float64Array) — a whole path in one call: the command
+// stream react-x11's context records (src/backend/context2d.js), each op
+// followed by its arguments, appended as the per-point verbs above would
+// append it. A graph's edges are tens of thousands of `lineTo`s a frame, and
+// a call across the boundary for each was milliseconds of every frame spent
+// on nothing but the crossing.
+//
+//   0 move x y              5 rect x y w h
+//   1 line x y              6 round rect x y w h r0 r1 r2 r3
+//   2 curve c1 c2 x y (6)   7 arc cx cy r start end anticlockwise
+//   3 quad c x y (4)        8 ellipse cx cy rx ry
+//   4 close
+//
+// A stream that ends inside an op, or names one this does not know, stops
+// there: what came before it stands, which is what the per-point verbs do
+// with a path a painter abandons half way.
+Napi::Value CtxPath(const Napi::CallbackInfo& info) {
+  Surface* s = Arg(info);
+  if (!s || info.Length() < 2 || !info[1].IsTypedArray()) return info.Env().Undefined();
+  Napi::Float64Array stream = info[1].As<Napi::Float64Array>();
+  const double* c = stream.Data();
+  const size_t n = stream.ElementLength();
+  static const int kArgs[] = {2, 2, 6, 4, 0, 4, 8, 6, 4};
+  const auto f = [&](size_t at) { return static_cast<float>(c[at]); };
+  size_t i = 0;
+  while (i < n) {
+    const double code = c[i];
+    if (!(code >= 0 && code <= 8)) break;
+    const int op = static_cast<int>(code);
+    if (i + 1 + kArgs[op] > n) break;
+    const size_t a = i + 1;
+    switch (op) {
+      case 0: s->path.push_back({PathOp::Move, f(a), f(a + 1)}); break;
+      case 1: s->path.push_back({PathOp::Line, f(a), f(a + 1)}); break;
+      case 2:
+        s->path.push_back({PathOp::Curve, f(a), f(a + 1), f(a + 2), f(a + 3),
+                           f(a + 4), f(a + 5)});
+        break;
+      case 3:
+        s->path.push_back({PathOp::Quad, f(a), f(a + 1), f(a + 2), f(a + 3)});
+        break;
+      case 4: s->path.push_back({PathOp::Close}); break;
+      case 5:
+        s->path.push_back({PathOp::Rect, f(a), f(a + 1), f(a + 2), f(a + 3)});
+        break;
+      case 6:
+        s->path.push_back({PathOp::RoundRect, f(a), f(a + 1), f(a + 2), f(a + 3),
+                           f(a + 4), f(a + 5), f(a + 6), f(a + 7)});
+        break;
+      case 7: {
+        PathCmd cmd = {PathOp::Arc, f(a), f(a + 1), f(a + 2), f(a + 3), f(a + 4)};
+        cmd.flag = c[a + 5] != 0;
+        s->path.push_back(cmd);
+        break;
+      }
+      case 8:
+        s->path.push_back({PathOp::Ellipse, f(a), f(a + 1), f(a + 2), f(a + 3)});
+        break;
+    }
+    i = a + kArgs[op];
+  }
+  return info.Env().Undefined();
+}
+
 // --- painting --------------------------------------------------------------
+
+// The shapes Direct2D draws as primitives: a rect, a round rect with one
+// radius, an ellipse and a whole circle, each the path's only figure. What
+// the renderer fills and strokes most — a card, its border, a handle, a
+// checkbox — is exactly one of them, and as a path geometry each was built,
+// tessellated on this thread and thrown away: ~35 us a card where the
+// primitive is a draw call. Anything else is a path, as before.
+enum class Shape { None, Rect, RoundRect, Ellipse };
+struct Primitive {
+  Shape shape = Shape::None;
+  D2D1_RECT_F rect = {};
+  float radius = 0;
+  D2D1_ELLIPSE ellipse = {};
+};
+
+Primitive PrimitiveOf(const Surface* s) {
+  Primitive out;
+  const auto& path = s->path;
+  if (path.empty() || path.size() > 2) return out;
+  // a closePath after a closed shape adds nothing
+  if (path.size() == 2 && path[1].op != PathOp::Close) return out;
+  const PathCmd& cmd = path[0];
+  const auto box = [](float x, float y, float w, float h) {
+    return D2D1::RectF((std::min)(x, x + w), (std::min)(y, y + h),
+                       (std::max)(x, x + w), (std::max)(y, y + h));
+  };
+  switch (cmd.op) {
+    case PathOp::Rect:
+      out.shape = Shape::Rect;
+      out.rect = box(cmd.a, cmd.b, cmd.c, cmd.d);
+      return out;
+    case PathOp::RoundRect: {
+      if (cmd.e != cmd.f || cmd.e != cmd.g || cmd.e != cmd.h) return out;
+      out.rect = box(cmd.a, cmd.b, cmd.c, cmd.d);
+      const float limit = (std::min)(out.rect.right - out.rect.left,
+                                     out.rect.bottom - out.rect.top) / 2;
+      out.radius = (std::min)(cmd.e, limit);
+      out.shape = out.radius > 0 ? Shape::RoundRect : Shape::Rect;
+      return out;
+    }
+    case PathOp::Ellipse:
+      out.shape = Shape::Ellipse;
+      out.ellipse = D2D1::Ellipse(D2D1::Point2F(cmd.a, cmd.b), cmd.c, cmd.d);
+      return out;
+    case PathOp::Arc: {
+      // the whole way round, and only that: a part of one is a path
+      float start = cmd.d, end = cmd.e;
+      if (cmd.flag) {
+        while (end > start) end -= 2 * kPi;
+      } else {
+        while (end < start) end += 2 * kPi;
+      }
+      if (std::fabs(end - start) < 2 * kPi - 1e-4f) return out;
+      out.shape = Shape::Ellipse;
+      out.ellipse = D2D1::Ellipse(D2D1::Point2F(cmd.a, cmd.b), cmd.c, cmd.c);
+      return out;
+    }
+    default:
+      return out;
+  }
+}
 
 Napi::Value CtxFill(const Napi::CallbackInfo& info) {
   Surface* s = Arg(info);
   if (!s || !s->dc) return info.Env().Undefined();
   const bool evenOdd = info.Length() > 1 && info[1].ToBoolean().Value();
+  const Primitive primitive = PrimitiveOf(s);
+  if (primitive.shape != Shape::None) {
+    ID2D1SolidColorBrush* brush = MakeBrush(s, s->state.fill);
+    if (!brush) return info.Env().Undefined();
+    if (primitive.shape == Shape::Rect) {
+      s->dc->FillRectangle(primitive.rect, brush);
+    } else if (primitive.shape == Shape::RoundRect) {
+      s->dc->FillRoundedRectangle(
+          D2D1::RoundedRect(primitive.rect, primitive.radius, primitive.radius), brush);
+    } else {
+      s->dc->FillEllipse(primitive.ellipse, brush);
+    }
+    brush->Release();
+    return info.Env().Undefined();
+  }
   ID2D1PathGeometry* geometry = BuildPath(s, evenOdd);
   if (!geometry) return info.Env().Undefined();
   ID2D1SolidColorBrush* brush = MakeBrush(s, s->state.fill);
@@ -582,6 +784,25 @@ Napi::Value CtxFill(const Napi::CallbackInfo& info) {
 Napi::Value CtxStroke(const Napi::CallbackInfo& info) {
   Surface* s = Arg(info);
   if (!s || !s->dc) return info.Env().Undefined();
+  const Primitive primitive = PrimitiveOf(s);
+  if (primitive.shape != Shape::None) {
+    ID2D1SolidColorBrush* brush = MakeBrush(s, s->state.stroke);
+    if (!brush) return info.Env().Undefined();
+    ID2D1StrokeStyle1* style = MakeStrokeStyle(s);
+    const float width = s->state.lineWidth;
+    if (primitive.shape == Shape::Rect) {
+      s->dc->DrawRectangle(primitive.rect, brush, width, style);
+    } else if (primitive.shape == Shape::RoundRect) {
+      s->dc->DrawRoundedRectangle(
+          D2D1::RoundedRect(primitive.rect, primitive.radius, primitive.radius), brush,
+          width, style);
+    } else {
+      s->dc->DrawEllipse(primitive.ellipse, brush, width, style);
+    }
+    if (style) style->Release();
+    brush->Release();
+    return info.Env().Undefined();
+  }
   ID2D1PathGeometry* geometry = BuildPath(s, false);
   if (!geometry) return info.Env().Undefined();
   ID2D1SolidColorBrush* brush = MakeBrush(s, s->state.stroke);
@@ -889,6 +1110,7 @@ void InitSurfaceExports(Napi::Env env, Napi::Object exports) {
   set("ctxCurveTo", CtxCurveTo);
   set("ctxQuadTo", CtxQuadTo);
   set("ctxClosePath", CtxClosePath);
+  set("ctxPath", CtxPath);
 
   set("ctxFill", CtxFill);
   set("ctxStroke", CtxStroke);

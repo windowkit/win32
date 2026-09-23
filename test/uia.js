@@ -135,6 +135,17 @@ async function main() {
   await sleep(200);
 
   const read = readBackThroughUia(TITLE);
+  // A client has read this window's tree, so the JS half is told to keep it
+  // current — the per-window answer UiaClientsAreListening cannot give,
+  // true on a desktop whenever anything anywhere is subscribed.
+  assert.equal(typeof win32.uiaActive, 'function', 'uiaActive is not exported');
+  assert.equal(win32.uiaActive(id), true, 'a client read the tree and the window is not active');
+  // the client ran synchronously; its events are delivered on the next turn
+  await sleep(100);
+  assert.ok(
+    events.some((e) => e.type === 'uia-wanted' && e.id === id),
+    'the read was not reported',
+  );
   console.log('uia       : client saw\n' + read.split('\n').map((l) => '            ' + l).join('\n'));
   assert.notEqual(read, 'NOWINDOW', 'the automation client could not find the window');
 
