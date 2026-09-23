@@ -185,13 +185,16 @@ ID2D1SolidColorBrush* MakeBrush(Surface* surface, const D2D1_COLOR_F& color) {
 ID2D1StrokeStyle1* MakeStrokeStyle(Surface* surface) {
   const GState& s = surface->state;
   // Direct2D's dash lengths are multiples of the stroke width, where canvas
-  // states them in pixels.
+  // states them in pixels — and so is its offset, which went across in
+  // pixels: a 2px line marched its dashes twice as far as canvas does. A
+  // solid stroke has no phase, so a leftover offset makes it no new style.
   std::vector<float> dashes;
   const float unit = s.lineWidth > 0 ? s.lineWidth : 1.0f;
   for (float d : s.dash) dashes.push_back(d / unit);
+  const float offset = s.dash.empty() ? 0.0f : s.dashOffset / unit;
 
   std::vector<float> key = {static_cast<float>(s.cap), static_cast<float>(s.join),
-                            s.dashOffset};
+                            offset};
   key.insert(key.end(), dashes.begin(), dashes.end());
   auto found = g_strokeStyles.find(key);
   if (found != g_strokeStyles.end()) {
@@ -206,7 +209,7 @@ ID2D1StrokeStyle1* MakeStrokeStyle(Surface* surface) {
   props.lineJoin = s.join;
   props.miterLimit = 10.0f;
   props.dashStyle = s.dash.empty() ? D2D1_DASH_STYLE_SOLID : D2D1_DASH_STYLE_CUSTOM;
-  props.dashOffset = s.dashOffset;
+  props.dashOffset = offset;
 
   ID2D1Factory* factory = nullptr;
   surface->dc->GetFactory(&factory);
