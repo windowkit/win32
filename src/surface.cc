@@ -624,6 +624,70 @@ Napi::Value CtxClosePath(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// ctxPath(surface, Float64Array) — a whole path in one call: the command
+// stream react-x11's context records (src/backend/context2d.js), each op
+// followed by its arguments, appended as the per-point verbs above would
+// append it. A graph's edges are tens of thousands of `lineTo`s a frame, and
+// a call across the boundary for each was milliseconds of every frame spent
+// on nothing but the crossing.
+//
+//   0 move x y              5 rect x y w h
+//   1 line x y              6 round rect x y w h r0 r1 r2 r3
+//   2 curve c1 c2 x y (6)   7 arc cx cy r start end anticlockwise
+//   3 quad c x y (4)        8 ellipse cx cy rx ry
+//   4 close
+//
+// A stream that ends inside an op, or names one this does not know, stops
+// there: what came before it stands, which is what the per-point verbs do
+// with a path a painter abandons half way.
+Napi::Value CtxPath(const Napi::CallbackInfo& info) {
+  Surface* s = Arg(info);
+  if (!s || info.Length() < 2 || !info[1].IsTypedArray()) return info.Env().Undefined();
+  Napi::Float64Array stream = info[1].As<Napi::Float64Array>();
+  const double* c = stream.Data();
+  const size_t n = stream.ElementLength();
+  static const int kArgs[] = {2, 2, 6, 4, 0, 4, 8, 6, 4};
+  const auto f = [&](size_t at) { return static_cast<float>(c[at]); };
+  size_t i = 0;
+  while (i < n) {
+    const double code = c[i];
+    if (!(code >= 0 && code <= 8)) break;
+    const int op = static_cast<int>(code);
+    if (i + 1 + kArgs[op] > n) break;
+    const size_t a = i + 1;
+    switch (op) {
+      case 0: s->path.push_back({PathOp::Move, f(a), f(a + 1)}); break;
+      case 1: s->path.push_back({PathOp::Line, f(a), f(a + 1)}); break;
+      case 2:
+        s->path.push_back({PathOp::Curve, f(a), f(a + 1), f(a + 2), f(a + 3),
+                           f(a + 4), f(a + 5)});
+        break;
+      case 3:
+        s->path.push_back({PathOp::Quad, f(a), f(a + 1), f(a + 2), f(a + 3)});
+        break;
+      case 4: s->path.push_back({PathOp::Close}); break;
+      case 5:
+        s->path.push_back({PathOp::Rect, f(a), f(a + 1), f(a + 2), f(a + 3)});
+        break;
+      case 6:
+        s->path.push_back({PathOp::RoundRect, f(a), f(a + 1), f(a + 2), f(a + 3),
+                           f(a + 4), f(a + 5), f(a + 6), f(a + 7)});
+        break;
+      case 7: {
+        PathCmd cmd = {PathOp::Arc, f(a), f(a + 1), f(a + 2), f(a + 3), f(a + 4)};
+        cmd.flag = c[a + 5] != 0;
+        s->path.push_back(cmd);
+        break;
+      }
+      case 8:
+        s->path.push_back({PathOp::Ellipse, f(a), f(a + 1), f(a + 2), f(a + 3)});
+        break;
+    }
+    i = a + kArgs[op];
+  }
+  return info.Env().Undefined();
+}
+
 // --- painting --------------------------------------------------------------
 
 // The shapes Direct2D draws as primitives: a rect, a round rect with one
@@ -1046,6 +1110,7 @@ void InitSurfaceExports(Napi::Env env, Napi::Object exports) {
   set("ctxCurveTo", CtxCurveTo);
   set("ctxQuadTo", CtxQuadTo);
   set("ctxClosePath", CtxClosePath);
+  set("ctxPath", CtxPath);
 
   set("ctxFill", CtxFill);
   set("ctxStroke", CtxStroke);
