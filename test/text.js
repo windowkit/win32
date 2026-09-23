@@ -207,6 +207,67 @@ assert.ok(
 assert.ok(bottom <= 20, `ink reaches y=${bottom}, below the baseline at 20`);
 assert.ok(top >= 8, `ink reaches y=${top}, far above a 16px cap height`);
 
+// --- coverage ---------------------------------------------------------------
+//
+// A layout's coverage without a surface (react-x11#673): one byte a pixel, the
+// layout box with a pad round it, the origin at (pad, pad). Checked against
+// the same layout drawn: the ink has to be in the same place, or a label
+// atlas made from it puts every string a fraction of a pixel off where the
+// 2D renderer draws it.
+
+const coverageLayout = win32.layoutCreate('Hamburg 12', { family: 'sans-serif', size: 32 });
+const coverageMetrics = win32.layoutMetrics(coverageLayout);
+const PAD = 4;
+const coverage = win32.layoutCoverage(coverageLayout, PAD);
+assert.ok(coverage, 'no coverage for a layout');
+assert.equal(coverage.width, coverageMetrics.width + PAD * 2);
+assert.equal(coverage.height, coverageMetrics.height + PAD * 2);
+assert.ok(coverage.data instanceof Uint8Array);
+assert.equal(coverage.data.length, coverage.width * coverage.height);
+
+let full = 0;
+let grey = 0;
+for (const a of coverage.data) {
+  if (a === 255) full++;
+  else if (a > 0) grey++;
+}
+console.log(`coverage  : ${coverage.width}x${coverage.height}, ${full} whole, ${grey} grey`);
+assert.ok(full > 50, 'no pixel is wholly covered — the texture is not coverage');
+assert.ok(grey > 50, 'no grey pixel — the texture is aliased, not antialiased');
+for (let x = 0; x < coverage.width; x++) {
+  assert.equal(coverage.data[x], 0, 'ink in the top pad row');
+}
+
+// The same layout drawn in white onto a transparent surface at (pad, pad):
+// the two centres of ink agree to a fraction of a pixel. (Not exactly:
+// Direct2D snaps and grid-fits what it draws, and coverage does neither.)
+const drawn = win32.createSurface(coverage.width, coverage.height, 1);
+win32.ctxSetFillColor(drawn, 1, 1, 1, 1);
+win32.drawLayout(drawn, coverageLayout, PAD, PAD);
+const drawnPixels = win32.ctxGetImageData(drawn, 0, 0, coverage.width, coverage.height);
+win32.releaseSurface(drawn);
+const centre = (at) => {
+  let sum = 0;
+  let sx = 0;
+  let sy = 0;
+  for (let y = 0; y < coverage.height; y++) {
+    for (let x = 0; x < coverage.width; x++) {
+      const a = at(x, y);
+      sum += a;
+      sx += a * x;
+      sy += a * y;
+    }
+  }
+  return [sx / sum, sy / sum];
+};
+const [cx, cy] = centre((x, y) => coverage.data[y * coverage.width + x]);
+const [dx, dy] = centre((x, y) => drawnPixels[(y * coverage.width + x) * 4 + 3]);
+console.log(`coverage  : ink centred at ${cx.toFixed(2)},${cy.toFixed(2)}, drawn at ${dx.toFixed(2)},${dy.toFixed(2)}`);
+assert.ok(Math.abs(cx - dx) < 0.75 && Math.abs(cy - dy) < 0.75, 'coverage is not where drawing puts the ink');
+
+assert.equal(win32.layoutCoverage(0, 2), null, 'a layout that does not exist has no coverage');
+win32.layoutRelease(coverageLayout);
+
 win32.layoutRelease(layout);
 win32.layoutRelease(wrapped);
 win32.releaseSurface(surface);

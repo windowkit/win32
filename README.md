@@ -101,7 +101,7 @@ Roughly by area:
 | | |
 | --- | --- |
 | **drawing** | 36 `ctx*` verbs on a Direct2D device context: paths, arcs, rounded rects, clips (axis-aligned and layered), gradients, shadows, images, `getImageData`/`putImageData`, `drawSurface` |
-| **text** | DirectWrite layouts with per-span formatting, line metrics, hit testing and carets; font matching, enumeration and loading; glyph runs (`fontHandle`, `fontGlyphForCodepoint`, `fontGlyphAdvances`, `ctxDrawGlyphs`); variable font axes |
+| **text** | DirectWrite layouts with per-span formatting, line metrics, hit testing and carets; font matching, enumeration and loading; glyph runs (`fontHandle`, `fontGlyphForCodepoint`, `fontGlyphAdvances`, `ctxDrawGlyphs`); a layout's coverage without a surface (`layoutCoverage`); variable font axes |
 | **windows** | create, show, move, resize, title, popups, transparency, DPI, `scrollRegion`, states (maximized, minimized, fullscreen, above, focused), `windowPixels` |
 | **input** | pointer with all five buttons and capture, wheel, keyboard through `ToUnicodeEx`, activation, IME composition through IMM32 with the preedit left to the renderer |
 | **drag and drop** | an `IDropTarget` on every window that wants one and `DoDragDrop` out of one, over OLE, with the drop effect decided in JS |
