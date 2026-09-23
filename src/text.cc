@@ -743,6 +743,168 @@ Napi::Value LayoutDraw(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// A text renderer that draws nothing: every glyph run a layout hands it is
+// rasterized by IDWriteGlyphRunAnalysis into a coverage buffer instead of a
+// device context, and every underline and strikethrough is filled into the
+// same buffer. It lives on the stack for one IDWriteTextLayout::Draw, which
+// does not keep it, so its reference count is a formality.
+class CoverageRenderer final : public IDWriteTextRenderer {
+ public:
+  CoverageRenderer(uint8_t* out, int width, int height)
+      : out_(out), width_(width), height_(height) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
+    if (riid == __uuidof(IDWriteTextRenderer) || riid == __uuidof(IDWritePixelSnapping) ||
+        riid == __uuidof(IUnknown)) {
+      *object = static_cast<IDWriteTextRenderer*>(this);
+      return S_OK;
+    }
+    *object = nullptr;
+    return E_NOINTERFACE;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+  ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+  // Glyphs at the positions the layout computed, unsnapped: a raster that
+  // will be scaled wants the outlines where they are, not where a pixel grid
+  // at this size would move them. One pixel is one DIP — the layout's units
+  // are the device pixels react-x11 sized it in.
+  HRESULT STDMETHODCALLTYPE IsPixelSnappingDisabled(void*, BOOL* disabled) override {
+    *disabled = TRUE;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetCurrentTransform(void*, DWRITE_MATRIX* transform) override {
+    *transform = {1, 0, 0, 1, 0, 0};
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetPixelsPerDip(void*, FLOAT* pixelsPerDip) override {
+    *pixelsPerDip = 1.0f;
+    return S_OK;
+  }
+
+  // Grayscale, grid fit off, and none of the gamma or enhanced contrast
+  // Direct2D applies when it blends text (GetAlphaBlendParams is what a
+  // renderer would apply, and this one does not): the outlines' own coverage.
+  // ALIASED_1x1 is the one-byte texture, and under grayscale antialiasing it
+  // holds grey levels rather than on/off.
+  HRESULT STDMETHODCALLTYPE DrawGlyphRun(void*, FLOAT x, FLOAT y,
+                                         DWRITE_MEASURING_MODE measuring,
+                                         const DWRITE_GLYPH_RUN* run,
+                                         const DWRITE_GLYPH_RUN_DESCRIPTION*,
+                                         IUnknown*) override {
+    IDWriteGlyphRunAnalysis* analysis = nullptr;
+    const HRESULT hr = g_dwrite->CreateGlyphRunAnalysis(
+        run, nullptr, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC, measuring,
+        DWRITE_GRID_FIT_MODE_DISABLED, DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE, x, y,
+        &analysis);
+    // A run that cannot be analysed covers nothing, which is what drawing it
+    // would have shown too.
+    if (FAILED(hr) || !analysis) return S_OK;
+    RECT bounds = {};
+    if (SUCCEEDED(analysis->GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1, &bounds)) &&
+        bounds.right > bounds.left && bounds.bottom > bounds.top) {
+      const int w = bounds.right - bounds.left;
+      const int h = bounds.bottom - bounds.top;
+      scratch_.resize(static_cast<size_t>(w) * h);
+      if (SUCCEEDED(analysis->CreateAlphaTexture(DWRITE_TEXTURE_ALIASED_1x1, &bounds,
+                                                 scratch_.data(),
+                                                 static_cast<UINT32>(scratch_.size())))) {
+        for (int r = 0; r < h; r++) {
+          for (int c = 0; c < w; c++) {
+            Put(bounds.left + c, bounds.top + r, scratch_[static_cast<size_t>(r) * w + c]);
+          }
+        }
+      }
+    }
+    analysis->Release();
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DrawUnderline(void*, FLOAT x, FLOAT y,
+                                          const DWRITE_UNDERLINE* line,
+                                          IUnknown*) override {
+    Fill(x, y + line->offset, line->width, line->thickness);
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DrawStrikethrough(void*, FLOAT x, FLOAT y,
+                                              const DWRITE_STRIKETHROUGH* line,
+                                              IUnknown*) override {
+    Fill(x, y + line->offset, line->width, line->thickness);
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE DrawInlineObject(void*, FLOAT, FLOAT, IDWriteInlineObject*,
+                                             BOOL, BOOL, IUnknown*) override {
+    return S_OK;
+  }
+
+ private:
+  // Two coverages of one pixel combine as alpha does under "over", a + b - ab:
+  // where glyphs overlap — a script's joins, a mark on its base — the pixel
+  // is covered once, not twice.
+  void Put(int x, int y, int a) {
+    if (a <= 0 || x < 0 || y < 0 || x >= width_ || y >= height_) return;
+    uint8_t& d = out_[static_cast<size_t>(y) * width_ + x];
+    d = static_cast<uint8_t>(d + a - (d * a + 127) / 255);
+  }
+
+  // A decoration, its edges covered by as much of each pixel as they reach.
+  void Fill(float x, float y, float w, float h) {
+    if (!(w > 0) || !(h > 0)) return;
+    const float x1 = x + w;
+    const float y1 = y + h;
+    for (int py = static_cast<int>(std::floor(y)); py < static_cast<int>(std::ceil(y1)); py++) {
+      const float cy = std::min(y1, py + 1.0f) - std::max(y, static_cast<float>(py));
+      for (int px = static_cast<int>(std::floor(x)); px < static_cast<int>(std::ceil(x1));
+           px++) {
+        const float cx = std::min(x1, px + 1.0f) - std::max(x, static_cast<float>(px));
+        Put(px, py, static_cast<int>(std::lround(255.0f * cx * cy)));
+      }
+    }
+  }
+
+  uint8_t* out_;
+  int width_;
+  int height_;
+  std::vector<BYTE> scratch_;
+};
+
+// layoutCoverage(layout, pad) -> { width, height, data } | null
+//
+// The layout's coverage — how much of each pixel its glyphs cover, one byte a
+// pixel — without drawing it anywhere, for text that is drawn somewhere a 2D
+// context is not: a GL surface's label atlas, a distance field
+// (sidorares/react-x11#673). The raster is the layout's box in whole pixels,
+// as layoutMetrics answers it, with `pad` pixels round it; the layout's
+// origin — the (x, y) drawLayout is handed — is at (pad, pad). Colour glyphs
+// come out as the coverage of their outlines: ink is the caller's.
+Napi::Value LayoutCoverage(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  TextLayout* entry = LayoutFor(info[0].As<Napi::Number>().Int32Value());
+  if (!entry || !g_dwrite) return env.Null();
+  const double asked =
+      info.Length() > 1 && info[1].IsNumber() ? info[1].As<Napi::Number>().DoubleValue() : 0;
+  const int pad = asked > 0 ? static_cast<int>(std::ceil(asked)) : 0;
+
+  DWRITE_TEXT_METRICS metrics = {};
+  entry->layout->GetMetrics(&metrics);
+  const int width = static_cast<int>(std::ceil(metrics.width)) + pad * 2;
+  const int height = static_cast<int>(std::ceil(metrics.height)) + pad * 2;
+  if (width <= 0 || height <= 0) return env.Null();
+
+  // A new ArrayBuffer is zeroed, which is "covers nothing".
+  Napi::Uint8Array data = Napi::Uint8Array::New(env, static_cast<size_t>(width) * height);
+  CoverageRenderer renderer(data.Data(), width, height);
+  entry->layout->Draw(nullptr, &renderer, static_cast<FLOAT>(pad), static_cast<FLOAT>(pad));
+
+  Napi::Object out = Napi::Object::New(env);
+  out.Set("width", Napi::Number::New(env, width));
+  out.Set("height", Napi::Number::New(env, height));
+  out.Set("data", data);
+  return out;
+}
+
 // The code-unit index under a point. fonts.js converts to code points, which
 // is the space the caret and the selection speak.
 Napi::Value LayoutIndexAt(const Napi::CallbackInfo& info) {
@@ -1297,6 +1459,7 @@ void InitTextExports(Napi::Env env, Napi::Object exports) {
   // native it was handed, so the bridge answers them as @windowkit/appkit does.
   set("drawLayout", LayoutDraw);
   set("drawLayoutGradient", DrawLayoutGradient);
+  set("layoutCoverage", LayoutCoverage);
   set("fontMetrics", FontMetrics);
   set("fontExists", FontExists);
   set("listFonts", ListFonts);
