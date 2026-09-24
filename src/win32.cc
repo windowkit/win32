@@ -303,6 +303,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       if (window && window->clickThrough) return HTTRANSPARENT;
       break;
 
+    // A press on a `<popup>` — a select's list, a menu — must not activate
+    // it. WS_EX_NOACTIVATE keeps the popup from becoming the foreground
+    // window when it is shown, but a click still activated it: the window it
+    // belongs to lost activation and reported a blur on the way to the
+    // press, and a blur is what closes a menu (react-x11 src/win32/app.js,
+    // `_dismissOutsidePopups`) — so the list closed under the pointer and
+    // the option pressed was never picked. MA_NOACTIVATE keeps the press and
+    // leaves activation where it was, which is what a menu does.
+    case WM_MOUSEACTIVATE:
+      if (window->popup) return MA_NOACTIVATE;
+      break;
+
     case WM_MOUSEMOVE: {
       // Windows sends no "the pointer left" message unless it is asked, once,
       // per entry. Without it a control keeps its :hover after the pointer has
@@ -492,6 +504,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
       if (HandleTaskbarMessage(window->id, message, wparam)) return 0;
       return ::DefWindowProcW(hwnd, message, wparam, lparam);
   }
+  // A case that `break`s asked for the default answer. Without this line it
+  // fell off the end of the function and answered whatever was left in a
+  // register — WM_NCHITTEST on every window that is not click-through, so
+  // where a press landed was up to the compiler.
+  return ::DefWindowProcW(hwnd, message, wparam, lparam);
 }
 
 LRESULT CALLBACK MessageProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
