@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.5](https://github.com/windowkit/win32/compare/v0.0.4...v0.0.5) (2026-09-24)
+
+
+### Bug fixes
+
+* a press on a popup leaves activation where it was ([#8](https://github.com/windowkit/win32/issues/8)) ([e79d663](https://github.com/windowkit/win32/commit/e79d663bfda8ffed66a5bd5fa2720679a62e633b))
+
 ## [0.0.4](https://github.com/windowkit/win32/compare/v0.0.3...v0.0.4) (2026-09-23)
 
 
