@@ -104,6 +104,36 @@ void AppendRoundRect(ID2D1GeometrySink* sink, const PathCmd& cmd) {
   sink->EndFigure(D2D1_FIGURE_END_CLOSED);
 }
 
+// A rounded rect whose corners are elliptical, each its own pair of radii
+// (e, f top left; g, h top right; i, j bottom right; k, l bottom left):
+// canvas's roundRect with `{ x, y }` radii. The caller has scaled them to
+// fit, as canvas does. A corner with no extent on one of its axes is no
+// curve at all, and is square — two lines would cut it off diagonally.
+void AppendRoundRectXY(ID2D1GeometrySink* sink, const PathCmd& cmd) {
+  const float x = cmd.a, y = cmd.b, r = cmd.a + cmd.c, b = cmd.b + cmd.d;
+  float radii[8] = {cmd.e, cmd.f, cmd.g, cmd.h, cmd.i, cmd.j, cmd.k, cmd.l};
+  for (int n = 0; n < 4; n++) {
+    if (!(radii[n * 2] > 0 && radii[n * 2 + 1] > 0)) radii[n * 2] = radii[n * 2 + 1] = 0;
+  }
+  const float tlx = radii[0], tly = radii[1], trx = radii[2], trY = radii[3];
+  const float brx = radii[4], brY = radii[5], blx = radii[6], blY = radii[7];
+  const auto corner = [&](D2D1_POINT_2F to, float rx, float ry) {
+    D2D1_ARC_SEGMENT s = {to, {rx, ry}, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                          D2D1_ARC_SIZE_SMALL};
+    sink->AddArc(s);
+  };
+  sink->BeginFigure({x + tlx, y}, D2D1_FIGURE_BEGIN_FILLED);
+  sink->AddLine({r - trx, y});
+  if (trx > 0) corner({r, y + trY}, trx, trY);
+  sink->AddLine({r, b - brY});
+  if (brx > 0) corner({r - brx, b}, brx, brY);
+  sink->AddLine({x + blx, b});
+  if (blx > 0) corner({x, b - blY}, blx, blY);
+  sink->AddLine({x, y + tly});
+  if (tlx > 0) corner({x + tlx, y}, tlx, tly);
+  sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -314,6 +344,13 @@ ID2D1PathGeometry* BuildPath(Surface* surface, bool evenOdd) {
           figureOpen = false;
         }
         AppendRoundRect(sink, cmd);
+        break;
+      case PathOp::RoundRectXY:
+        if (figureOpen) {
+          sink->EndFigure(D2D1_FIGURE_END_OPEN);
+          figureOpen = false;
+        }
+        AppendRoundRectXY(sink, cmd);
         break;
       case PathOp::Arc:
         AppendArc(sink, cmd.a, cmd.b, cmd.c, cmd.c, cmd.d, cmd.e, cmd.flag,
@@ -584,6 +621,22 @@ Napi::Value CtxRoundRect(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// roundRectXY(surface, x, y, w, h, tlx, tly, trx, try, brx, bry, blx, bly)
+// — appkit's verb: elliptical corners, each its own pair of radii.
+Napi::Value CtxRoundRectXY(const Napi::CallbackInfo& info) {
+  Surface* s = Arg(info);
+  if (s) {
+    PathCmd cmd = {PathOp::RoundRectXY, F(info, 1), F(info, 2), F(info, 3),
+                   F(info, 4), F(info, 5), F(info, 6), F(info, 7), F(info, 8)};
+    cmd.i = F(info, 9);
+    cmd.j = F(info, 10);
+    cmd.k = F(info, 11);
+    cmd.l = F(info, 12);
+    s->path.push_back(cmd);
+  }
+  return info.Env().Undefined();
+}
+
 Napi::Value CtxArc(const Napi::CallbackInfo& info) {
   Surface* s = Arg(info);
   if (s) {
@@ -638,8 +691,11 @@ Napi::Value CtxClosePath(const Napi::CallbackInfo& info) {
 //   1 line x y              6 round rect x y w h r0 r1 r2 r3
 //   2 curve c1 c2 x y (6)   7 arc cx cy r start end anticlockwise
 //   3 quad c x y (4)        8 ellipse cx cy rx ry
-//   4 close
+//   4 close                 9 round rect x y w h, then each corner's
+//                             x and y radius from the top left (12)
 //
+// A bridge that answers ctxRoundRectXY reads op 9 too: that is how
+// react-x11 knows it may send one, where an older bridge is sent curves.
 // A stream that ends inside an op, or names one this does not know, stops
 // there: what came before it stands, which is what the per-point verbs do
 // with a path a painter abandons half way.
@@ -649,12 +705,12 @@ Napi::Value CtxPath(const Napi::CallbackInfo& info) {
   Napi::Float64Array stream = info[1].As<Napi::Float64Array>();
   const double* c = stream.Data();
   const size_t n = stream.ElementLength();
-  static const int kArgs[] = {2, 2, 6, 4, 0, 4, 8, 6, 4};
+  static const int kArgs[] = {2, 2, 6, 4, 0, 4, 8, 6, 4, 12};
   const auto f = [&](size_t at) { return static_cast<float>(c[at]); };
   size_t i = 0;
   while (i < n) {
     const double code = c[i];
-    if (!(code >= 0 && code <= 8)) break;
+    if (!(code >= 0 && code <= 9)) break;
     const int op = static_cast<int>(code);
     if (i + 1 + kArgs[op] > n) break;
     const size_t a = i + 1;
@@ -685,6 +741,16 @@ Napi::Value CtxPath(const Napi::CallbackInfo& info) {
       case 8:
         s->path.push_back({PathOp::Ellipse, f(a), f(a + 1), f(a + 2), f(a + 3)});
         break;
+      case 9: {
+        PathCmd cmd = {PathOp::RoundRectXY, f(a), f(a + 1), f(a + 2), f(a + 3),
+                       f(a + 4), f(a + 5), f(a + 6), f(a + 7)};
+        cmd.i = f(a + 8);
+        cmd.j = f(a + 9);
+        cmd.k = f(a + 10);
+        cmd.l = f(a + 11);
+        s->path.push_back(cmd);
+        break;
+      }
     }
     i = a + kArgs[op];
   }
@@ -704,6 +770,9 @@ struct Primitive {
   Shape shape = Shape::None;
   D2D1_RECT_F rect = {};
   float radius = 0;
+  // a round rect's vertical radius, where its corners are elliptical and
+  // all alike — Direct2D's rounded rect has the two
+  float radiusY = 0;
   D2D1_ELLIPSE ellipse = {};
 };
 
@@ -729,7 +798,20 @@ Primitive PrimitiveOf(const Surface* s) {
       const float limit = (std::min)(out.rect.right - out.rect.left,
                                      out.rect.bottom - out.rect.top) / 2;
       out.radius = (std::min)(cmd.e, limit);
+      out.radiusY = out.radius;
       out.shape = out.radius > 0 ? Shape::RoundRect : Shape::Rect;
+      return out;
+    }
+    case PathOp::RoundRectXY: {
+      // four corners alike, which one Direct2D rounded rect draws
+      if (cmd.e != cmd.g || cmd.e != cmd.i || cmd.e != cmd.k) return out;
+      if (cmd.f != cmd.h || cmd.f != cmd.j || cmd.f != cmd.l) return out;
+      if (!(cmd.c >= 0 && cmd.d >= 0)) return out;
+      out.rect = box(cmd.a, cmd.b, cmd.c, cmd.d);
+      const bool curved = cmd.e > 0 && cmd.f > 0;
+      out.radius = curved ? (std::min)(cmd.e, (out.rect.right - out.rect.left) / 2) : 0;
+      out.radiusY = curved ? (std::min)(cmd.f, (out.rect.bottom - out.rect.top) / 2) : 0;
+      out.shape = curved ? Shape::RoundRect : Shape::Rect;
       return out;
     }
     case PathOp::Ellipse:
@@ -766,7 +848,7 @@ Napi::Value CtxFill(const Napi::CallbackInfo& info) {
       s->dc->FillRectangle(primitive.rect, brush);
     } else if (primitive.shape == Shape::RoundRect) {
       s->dc->FillRoundedRectangle(
-          D2D1::RoundedRect(primitive.rect, primitive.radius, primitive.radius), brush);
+          D2D1::RoundedRect(primitive.rect, primitive.radius, primitive.radiusY), brush);
     } else {
       s->dc->FillEllipse(primitive.ellipse, brush);
     }
@@ -797,7 +879,7 @@ Napi::Value CtxStroke(const Napi::CallbackInfo& info) {
       s->dc->DrawRectangle(primitive.rect, brush, width, style);
     } else if (primitive.shape == Shape::RoundRect) {
       s->dc->DrawRoundedRectangle(
-          D2D1::RoundedRect(primitive.rect, primitive.radius, primitive.radius), brush,
+          D2D1::RoundedRect(primitive.rect, primitive.radius, primitive.radiusY), brush,
           width, style);
     } else {
       s->dc->DrawEllipse(primitive.ellipse, brush, width, style);
@@ -1108,6 +1190,7 @@ void InitSurfaceExports(Napi::Env env, Napi::Object exports) {
   set("ctxLineTo", CtxLineTo);
   set("ctxRect", CtxRect);
   set("ctxRoundRect", CtxRoundRect);
+  set("ctxRoundRectXY", CtxRoundRectXY);
   set("ctxArc", CtxArc);
   set("ctxEllipse", CtxEllipse);
   set("ctxCurveTo", CtxCurveTo);

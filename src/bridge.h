@@ -39,11 +39,14 @@ extern IDWriteFactory3* g_dwrite;
 // all, and models a clip as a push/pop — so the stack is ours to keep, and a
 // restore has to unwind exactly the clips its save left open.
 
-enum class PathOp { Move, Line, Curve, Quad, Close, Rect, RoundRect, Arc, Ellipse };
+enum class PathOp { Move, Line, Curve, Quad, Close, Rect, RoundRect, Arc, Ellipse, RoundRectXY };
 
 struct PathCmd {
   PathOp op;
   float a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0;
+  // the four more a RoundRectXY carries: its corners' radii are eight
+  // numbers, e to l, a pair to a corner from the top left
+  float i = 0, j = 0, k = 0, l = 0;
   bool flag = false;
 };
 
