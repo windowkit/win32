@@ -72,6 +72,13 @@ const cases = {
     if (path) win32.ctxMoveTo(s, 100, 45);
     win32.ctxEllipse(s, 60, 45, 40, 25);
   },
+  // corners elliptical and all alike: one Direct2D rounded rect, which has
+  // an x and a y radius of its own
+  'elliptical round rect': (s, path) => {
+    win32.ctxBeginPath(s);
+    if (path) win32.ctxMoveTo(s, 20, 15);
+    win32.ctxRoundRectXY(s, 20, 15, 80, 60, 24, 10, 24, 10, 24, 10, 24, 10);
+  },
 };
 
 for (const [name, shape] of Object.entries(cases)) {
@@ -105,6 +112,23 @@ for (const [name, shape] of Object.entries(cases)) {
   assert.ok(pixels[i] > 200 && pixels[i + 1] > 200, 'the top-left corner is rounded');
   const j = (16 * W + 98) * 4; // the top-right corner is square
   assert.ok(pixels[j] < 120, 'and the top-right one is not');
+}
+
+// Elliptical corners of their own: a path, the corners cut as ellipses —
+// shallow where wider than tall — and one with no extent on an axis square.
+{
+  const draw = (s) => {
+    colour(s);
+    win32.ctxBeginPath(s);
+    win32.ctxRoundRectXY(s, 20, 15, 80, 60, 40, 10, 0, 20, 20, 20, 10, 0);
+    win32.ctxFill(s, false);
+  };
+  const pixels = render(draw);
+  const at = (x, y) => pixels[(y * W + x) * 4];
+  assert.ok(at(21, 16) > 200, 'the top-left corner is cut away');
+  assert.ok(at(50, 16) < 120, 'but not past most of its shallow ellipse');
+  assert.ok(at(98, 16) < 120, 'a corner 0 across is square');
+  assert.ok(at(21, 73) < 120, 'and so is one 0 down');
 }
 
 win32.stop();

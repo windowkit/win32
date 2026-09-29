@@ -46,6 +46,7 @@ const stream = [
   6, 75, 50, 35, 30, 6, 6, 6, 6,
   7, 30, 70, 10, 0, Math.PI * 1.5, 0,
   8, 100, 70, 12, 8,
+  9, 45, 20, 30, 25, 10, 5, 0, 0, 6, 12, 3, 3,
 ];
 
 const perPoint = render((s) => {
@@ -58,6 +59,7 @@ const perPoint = render((s) => {
   win32.ctxRoundRect(s, 75, 50, 35, 30, 6, 6, 6, 6);
   win32.ctxArc(s, 30, 70, 10, 0, Math.PI * 1.5, false);
   win32.ctxEllipse(s, 100, 70, 12, 8);
+  win32.ctxRoundRectXY(s, 45, 20, 30, 25, 10, 5, 0, 0, 6, 12, 3, 3);
 });
 const whole = render((s) => win32.ctxPath(s, new Float64Array(stream)));
 assert.ok(same(perPoint, whole), 'the stream draws what the verbs draw');
