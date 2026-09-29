@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.6](https://github.com/windowkit/win32/compare/v0.0.5...v0.0.6) (2026-09-29)
+
+
+### Features
+
+* ctxRoundRectXY and op 9, a rounded rect whose corners are elliptical ([#10](https://github.com/windowkit/win32/issues/10)) ([bb4cb30](https://github.com/windowkit/win32/commit/bb4cb300e05907ab7eafa7150cbe3d218af1d2e2))
+
 ## [0.0.5](https://github.com/windowkit/win32/compare/v0.0.4...v0.0.5) (2026-09-24)
 
 
