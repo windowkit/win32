@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.7](https://github.com/windowkit/win32/compare/v0.0.6...v0.0.7) (2026-10-03)
+
+
+### Features
+
+* ctxClip takes the fill rule ctxFill takes, so a ring clipped evenodd cuts a ring where it cut the square around it ([#12](https://github.com/windowkit/win32/issues/12)) ([9380558](https://github.com/windowkit/win32/commit/938055880bef49725265c6edc2f6339a648b51c6))
+
 ## [0.0.6](https://github.com/windowkit/win32/compare/v0.0.5...v0.0.6) (2026-09-29)
 
 
