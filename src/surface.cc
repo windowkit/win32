@@ -901,15 +901,21 @@ Napi::Value CtxStroke(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// ctxClip(surface, evenOdd): the flag ctxFill takes, so canvas's
+// clip(path, 'evenodd') — an SVG <clipPath> with clip-rule="evenodd" — cuts
+// a ring rather than the square around it. Absent is nonzero, as before.
 Napi::Value CtxClip(const Napi::CallbackInfo& info) {
   Surface* s = Arg(info);
   if (!s || !s->dc) return info.Env().Undefined();
-  ID2D1PathGeometry* geometry = BuildPath(s, false);
+  const bool evenOdd = info.Length() > 1 && info[1].ToBoolean().Value();
+  ID2D1PathGeometry* geometry = BuildPath(s, evenOdd);
   if (!geometry) return info.Env().Undefined();
 
   // An axis-aligned rectangle under an axis-aligned transform is the clip
   // every paint pass sets, and PushAxisAlignedClip is far cheaper than a
-  // layer with a geometric mask. Anything else takes the layer.
+  // layer with a geometric mask. Anything else takes the layer. The rule
+  // does not enter into it: one rect is one figure wound once, which either
+  // fill mode cuts alike.
   D2D1_RECT_F bounds = {};
   bool rectangular = false;
   if (s->path.size() == 1 && s->path[0].op == PathOp::Rect) {
