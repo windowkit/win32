@@ -63,6 +63,19 @@ DWRITE_FONT_WEIGHT WeightOf(int weight) {
   return static_cast<DWRITE_FONT_WEIGHT>(std::clamp(weight, 1, 999));
 }
 
+// DirectWrite's nine widths, 1 (ultra-condensed) to 9 (ultra-expanded), with
+// 5 normal — CSS's `font-stretch` keywords in the same order.
+DWRITE_FONT_STRETCH StretchOf(int stretch) {
+  return static_cast<DWRITE_FONT_STRETCH>(std::clamp(stretch, 1, 9));
+}
+
+// An optional width argument: absent, or not a number, is normal.
+DWRITE_FONT_STRETCH StretchArg(const Napi::CallbackInfo& info, size_t at) {
+  return info.Length() > at && info[at].IsNumber()
+             ? StretchOf(info[at].As<Napi::Number>().Int32Value())
+             : DWRITE_FONT_STRETCH_NORMAL;
+}
+
 // The generic families, resolved the way docs/windows.md names them. Segoe UI
 // is the system face on every supported build; Segoe UI Variable on Windows 11
 // carries an optical-size axis the way SF does.
@@ -483,6 +496,47 @@ bool ApplyAxes(IDWriteTextLayout* layout, const Napi::Value& value,
   return SUCCEEDED(hr);
 }
 
+// A span's OpenType features, `{ smcp: 1, liga: 0 }`: a tag and a value each
+// — 1 on, 0 off, or an alternate's index — as CSS's `font-feature-settings`
+// writes them, and as react-x11's other two engines take them. The shaper's
+// own defaults stay on but where a tag here says otherwise.
+void ApplyFeatures(IDWriteTextLayout* layout, const Napi::Value& value,
+                   DWRITE_TEXT_RANGE range) {
+  if (!value.IsObject()) return;
+  const Napi::Object features = value.As<Napi::Object>();
+  IDWriteTypography* typography = nullptr;
+  if (FAILED(g_dwrite->CreateTypography(&typography)) || !typography) return;
+  const Napi::Array tags = features.GetPropertyNames();
+  UINT32 added = 0;
+  for (uint32_t i = 0; i < tags.Length(); i++) {
+    const std::string tag = tags.Get(i).As<Napi::String>().Utf8Value();
+    if (tag.size() != 4) continue;
+    const Napi::Value raw = features.Get(tags.Get(i));
+    if (!raw.IsNumber()) continue;
+    DWRITE_FONT_FEATURE feature = {};
+    feature.nameTag = static_cast<DWRITE_FONT_FEATURE_TAG>(
+        DWRITE_MAKE_OPENTYPE_TAG(tag[0], tag[1], tag[2], tag[3]));
+    feature.parameter = raw.As<Napi::Number>().Uint32Value();
+    if (SUCCEEDED(typography->AddFontFeature(feature))) added++;
+  }
+  if (added) layout->SetTypography(typography, range);
+  typography->Release();
+}
+
+// A span's letter spacing, CSS's: that many pixels after each character,
+// the last of the span included, as Blink spaces a run.
+void ApplySpacing(IDWriteTextLayout* layout, float spacing, DWRITE_TEXT_RANGE range) {
+  if (spacing == 0 || !std::isfinite(spacing)) return;
+  IDWriteTextLayout1* layout1 = nullptr;
+  if (FAILED(layout->QueryInterface(__uuidof(IDWriteTextLayout1),
+                                    reinterpret_cast<void**>(&layout1))) ||
+      !layout1) {
+    return;
+  }
+  layout1->SetCharacterSpacing(0, spacing, 0, range);
+  layout1->Release();
+}
+
 Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (!g_dwrite) {
@@ -502,6 +556,10 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
   const int weight =
       Given(options, "weight") ? options.Get("weight").As<Napi::Number>().Int32Value() : 400;
   const bool italic = Given(options, "italic") && options.Get("italic").ToBoolean().Value();
+  const DWRITE_FONT_STRETCH stretch =
+      Given(options, "stretch")
+          ? StretchOf(options.Get("stretch").As<Napi::Number>().Int32Value())
+          : DWRITE_FONT_STRETCH_NORMAL;
   const bool rtl = Given(options, "rtl") && options.Get("rtl").ToBoolean().Value();
   float maxWidth = Given(options, "maxWidth")
                        ? static_cast<float>(options.Get("maxWidth").As<Napi::Number>().DoubleValue())
@@ -515,8 +573,8 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
   IDWriteTextFormat* format = nullptr;
   HRESULT hr = g_dwrite->CreateTextFormat(
       family.c_str(), CollectionFor(family), WeightOf(weight),
-      italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
-      DWRITE_FONT_STRETCH_NORMAL, size, L"", &format);
+      italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, stretch, size, L"",
+      &format);
   if (FAILED(hr) || !format) {
     Napi::Error::New(env, "layoutCreate: CreateTextFormat failed")
         .ThrowAsJavaScriptException();
@@ -596,6 +654,16 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
                                  : DWRITE_FONT_STYLE_NORMAL,
                              range);
       }
+      if (Given(span, "stretch")) {
+        layout->SetFontStretch(StretchOf(span.Get("stretch").As<Napi::Number>().Int32Value()),
+                               range);
+      }
+      if (Given(span, "letterSpacing")) {
+        ApplySpacing(layout,
+                     static_cast<float>(span.Get("letterSpacing").As<Napi::Number>().DoubleValue()),
+                     range);
+      }
+      if (Given(span, "features")) ApplyFeatures(layout, span.Get("features"), range);
       if (Given(span, "variations")) {
         ApplyAxes(layout, span.Get("variations"), range);
       }
@@ -1016,7 +1084,7 @@ Napi::Value FontMetrics(const Napi::CallbackInfo& info) {
   IDWriteFont* font = nullptr;
   fontFamily->GetFirstMatchingFont(
       WeightOf(info.Length() > 2 ? info[2].As<Napi::Number>().Int32Value() : 400),
-      DWRITE_FONT_STRETCH_NORMAL,
+      StretchArg(info, 4),
       info.Length() > 3 && info[3].ToBoolean().Value() ? DWRITE_FONT_STYLE_ITALIC
                                                        : DWRITE_FONT_STYLE_NORMAL,
       &font);
@@ -1034,6 +1102,11 @@ Napi::Value FontMetrics(const Napi::CallbackInfo& info) {
   out.Set("lineGap", Napi::Number::New(env, metrics.lineGap * scale));
   out.Set("height", Napi::Number::New(
                         env, (metrics.ascent + metrics.descent + metrics.lineGap) * scale));
+  // The x-height and the cap height, which CSS's `ex` and `cap` units are
+  // measured in. DirectWrite synthesizes an x-height for a face whose OS/2
+  // table states none, as Blink's own fallback does.
+  out.Set("xHeight", Napi::Number::New(env, metrics.xHeight * scale));
+  out.Set("capHeight", Napi::Number::New(env, metrics.capHeight * scale));
   out.Set("underlinePosition",
           Napi::Number::New(env, metrics.underlinePosition * scale));
   out.Set("underlineThickness",
@@ -1059,6 +1132,67 @@ Napi::Value FontExists(const Napi::CallbackInfo& info) {
   collection->FindFamilyName(wanted.c_str(), &index, &exists);
   collection->Release();
   return Napi::Boolean::New(env, exists == TRUE);
+}
+
+// fontFamilyOf(name) -> { family, weight, stretch, italic } | null: a name the
+// system collection has no family by, looked up as GDI looks a face name up.
+//
+// DirectWrite groups faces by weight, width and slope, so the families a
+// Windows user knows by name — "Arial Black", "Arial Narrow", "Segoe UI
+// Light", "Franklin Gothic Medium" — are faces of "Arial", "Segoe UI" and
+// "Franklin Gothic" here, and `fontExists` says no to each. Every other
+// Windows program finds them, Chrome among them, and a page that names one
+// fell back to the default face. This answers the family DirectWrite files
+// the face under and the face's own weight, width and slope, which together
+// reach it. Null for a name GDI has no face by either.
+Napi::Value FontFamilyOf(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!g_dwrite || info.Length() < 1 || !info[0].IsString()) return env.Null();
+  const std::wstring wanted = Wide(info[0]);
+  if (wanted.empty() || wanted.size() >= LF_FACESIZE) return env.Null();
+
+  IDWriteGdiInterop* interop = nullptr;
+  if (FAILED(g_dwrite->GetGdiInterop(&interop)) || !interop) return env.Null();
+  LOGFONTW logfont = {};
+  wcsncpy_s(logfont.lfFaceName, wanted.c_str(), LF_FACESIZE - 1);
+  logfont.lfWeight = FW_NORMAL;
+  logfont.lfCharSet = DEFAULT_CHARSET;
+  IDWriteFont* font = nullptr;
+  const HRESULT hr = interop->CreateFontFromLOGFONT(&logfont, &font);
+  interop->Release();
+  if (FAILED(hr) || !font) return env.Null();
+
+  IDWriteFontFamily* family = nullptr;
+  IDWriteLocalizedStrings* names = nullptr;
+  std::wstring name;
+  if (SUCCEEDED(font->GetFontFamily(&family)) && family &&
+      SUCCEEDED(family->GetFamilyNames(&names)) && names) {
+    UINT32 index = 0;
+    BOOL found = FALSE;
+    names->FindLocaleName(L"en-us", &index, &found);
+    if (!found) index = 0;
+    UINT32 length = 0;
+    if (SUCCEEDED(names->GetStringLength(index, &length))) {
+      name.resize(length + 1);
+      names->GetString(index, name.data(), length + 1);
+      name.resize(length);
+    }
+  }
+  if (names) names->Release();
+  if (family) family->Release();
+  const DWRITE_FONT_WEIGHT weight = font->GetWeight();
+  const DWRITE_FONT_STRETCH stretch = font->GetStretch();
+  const DWRITE_FONT_STYLE style = font->GetStyle();
+  font->Release();
+  if (name.empty()) return env.Null();
+
+  Napi::Object out = Napi::Object::New(env);
+  out.Set("family", Napi::String::New(env, reinterpret_cast<const char16_t*>(name.c_str()),
+                                      name.size()));
+  out.Set("weight", Napi::Number::New(env, static_cast<int>(weight)));
+  out.Set("stretch", Napi::Number::New(env, static_cast<int>(stretch)));
+  out.Set("italic", Napi::Boolean::New(env, style != DWRITE_FONT_STYLE_NORMAL));
+  return out;
 }
 
 // The path a face was loaded from, where it came from a file at all. A font
@@ -1250,10 +1384,11 @@ Napi::Value FontHandle(const Napi::CallbackInfo& info) {
   const float size = static_cast<float>(info[1].As<Napi::Number>().DoubleValue());
   const int weight = info.Length() > 2 ? info[2].As<Napi::Number>().Int32Value() : 400;
   const bool italic = info.Length() > 3 && info[3].ToBoolean().Value();
+  const DWRITE_FONT_STRETCH stretch = StretchArg(info, 4);
   if (!(size > 0)) return Napi::Number::New(env, 0);
 
   wchar_t key[64] = {};
-  swprintf(key, 64, L"|%d|%d|%d", weight, italic ? 1 : 0,
+  swprintf(key, 64, L"|%d|%d|%d|%d", weight, italic ? 1 : 0, static_cast<int>(stretch),
            static_cast<int>(size * 64));
   const std::wstring cacheKey = family + key;
   auto cached = g_glyphFontIds.find(cacheKey);
@@ -1288,7 +1423,7 @@ Napi::Value FontHandle(const Napi::CallbackInfo& info) {
 
   IDWriteFont* font = nullptr;
   fontFamily->GetFirstMatchingFont(
-      WeightOf(weight), DWRITE_FONT_STRETCH_NORMAL,
+      WeightOf(weight), stretch,
       italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, &font);
   fontFamily->Release();
   if (!font) return Napi::Number::New(env, 0);
@@ -1462,6 +1597,7 @@ void InitTextExports(Napi::Env env, Napi::Object exports) {
   set("layoutCoverage", LayoutCoverage);
   set("fontMetrics", FontMetrics);
   set("fontExists", FontExists);
+  set("fontFamilyOf", FontFamilyOf);
   set("listFonts", ListFonts);
   set("fontLoad", FontLoad);
   set("fontHandle", FontHandle);
