@@ -44,6 +44,55 @@ assert.ok(fontMetrics.ascent > 0 && fontMetrics.descent > 0, 'no face metrics');
 assert.strictEqual(win32.fontExists('Segoe UI'), true);
 assert.strictEqual(win32.fontExists('No Such Font At All'), false);
 
+// What `ex` and `cap` are measured in.
+assert.ok(
+  fontMetrics.xHeight > 0 && fontMetrics.xHeight < fontMetrics.ascent,
+  `no x-height: ${fontMetrics.xHeight}`,
+);
+assert.ok(
+  fontMetrics.capHeight > fontMetrics.xHeight,
+  `no cap height: ${fontMetrics.capHeight}`,
+);
+
+// A face GDI knows by a name DirectWrite files under another family: Segoe
+// UI Semibold is Segoe UI at 600 here, and no family of its own. Segoe UI
+// ships with every supported build, and its Semibold face with it.
+assert.strictEqual(win32.fontExists('Segoe UI Semibold'), false);
+const semibold = win32.fontFamilyOf('Segoe UI Semibold');
+console.log('Segoe UI Semibold:', semibold);
+assert.strictEqual(semibold?.family, 'Segoe UI');
+assert.strictEqual(semibold.weight, 600);
+assert.strictEqual(semibold.stretch, 5);
+assert.strictEqual(semibold.italic, false);
+assert.strictEqual(win32.fontFamilyOf('No Such Font At All'), null);
+
+// A width reaches a face by it, and is part of what a handle is cached on.
+const normalHandle = win32.fontHandle('Segoe UI', 16, 400, false);
+const narrowHandle = win32.fontHandle('Segoe UI', 16, 400, false, 3);
+assert.ok(normalHandle > 0 && narrowHandle > 0, 'no glyph handles');
+assert.strictEqual(win32.fontHandle('Segoe UI', 16, 400, false, 5), normalHandle);
+const condensed = win32.layoutMetrics(
+  win32.layoutCreate('Narrow', { family: 'Segoe UI', size: 16 }, [
+    { start: 0, length: 6, stretch: 3 },
+  ]),
+);
+assert.ok(condensed.width > 0, 'a span with a width laid out nothing');
+
+// Letter spacing: two pixels after each of five characters is ten pixels
+// wider, as CSS's `letter-spacing` sets a run.
+const widthOf = (spans) =>
+  win32.layoutMetrics(win32.layoutCreate('Hello', { family: 'Segoe UI', size: 16 }, spans))
+    .width;
+const tight = widthOf([{ start: 0, length: 5 }]);
+const spaced = widthOf([{ start: 0, length: 5, letterSpacing: 2 }]);
+console.log('letter spacing:', tight, '->', spaced);
+assert.ok(Math.abs(spaced - tight - 10) <= 1, `spaced by ${spaced - tight}, not 10`);
+// OpenType features by tag: a layout with them is a layout
+assert.ok(
+  widthOf([{ start: 0, length: 5, features: { smcp: 1, liga: 0, 'bad!!': 1 } }]) > 0,
+  'a span with features laid out nothing',
+);
+
 // --- drawing through the verb table ----------------------------------------
 
 const surface = win32.createSurface(200, 100, 1);
