@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.9](https://github.com/windowkit/win32/compare/v0.0.8...v0.0.9) (2026-10-04)
+
+
+### Features
+
+* **text:** `justify: true` justifies a layout's lines as DirectWrite does, `layoutMetrics(handle, { minWidth: false })` leaves the min-content width to `layoutMinWidth`, and `textFeatures()` says what a layout takes — where a caller justified each paragraph by spacing its words itself, in three layouts, and every layout ran the line breaker a second time for a width nobody asked for ([#16](https://github.com/windowkit/win32/issues/16)) ([686defa](https://github.com/windowkit/win32/commit/686defa9f2351a4e9687fe0230a83622257765a5))
+
 ## [0.0.8](https://github.com/windowkit/win32/compare/v0.0.7...v0.0.8) (2026-10-04)
 
 
