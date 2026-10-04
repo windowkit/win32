@@ -587,6 +587,14 @@ Napi::Value LayoutCreate(const Napi::CallbackInfo& info) {
                              : align == "right" ? DWRITE_TEXT_ALIGNMENT_TRAILING
                                                 : DWRITE_TEXT_ALIGNMENT_LEADING);
   }
+  // `justify: true`: every line but a paragraph's last set to fill the
+  // width at its word separators, after it is broken — DirectWrite's own
+  // justification, from the shaping the layout already did, where a caller
+  // that spaced the words itself laid the paragraph out three times over.
+  // The line before a newline ends a paragraph and is left as it is.
+  if (Given(options, "justify") && options.Get("justify").ToBoolean().Value() && !unbounded) {
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_JUSTIFIED);
+  }
   format->SetReadingDirection(rtl ? DWRITE_READING_DIRECTION_RIGHT_TO_LEFT
                                   : DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
   if (Given(options, "lineHeight")) {
@@ -697,15 +705,22 @@ Napi::Value LayoutMetrics(const Napi::CallbackInfo& info) {
   DWRITE_TEXT_METRICS metrics = {};
   entry->layout->GetMetrics(&metrics);
 
-  float minWidth = 0;
-  entry->layout->DetermineMinWidth(&minWidth);
-
   Napi::Object out = Napi::Object::New(env);
   // Whole device pixels, rounded up, at the same boundary the CoreText engine
   // rounds: a fractional measure is what makes a yoga layout blow up.
   out.Set("width", Napi::Number::New(env, std::ceil(metrics.width)));
   out.Set("height", Napi::Number::New(env, std::ceil(metrics.height)));
-  out.Set("minWidth", Napi::Number::New(env, std::ceil(minWidth)));
+  // `{ minWidth: false }` leaves the min-content width to `layoutMinWidth`:
+  // DetermineMinWidth runs the line breaker over the whole text again, and a
+  // caller that lays a paragraph out to draw it never asks.
+  const bool wantsMin = !(info.Length() > 1 && info[1].IsObject() &&
+                          info[1].As<Napi::Object>().Has("minWidth") &&
+                          !info[1].As<Napi::Object>().Get("minWidth").ToBoolean().Value());
+  if (wantsMin) {
+    float minWidth = 0;
+    entry->layout->DetermineMinWidth(&minWidth);
+    out.Set("minWidth", Napi::Number::New(env, std::ceil(minWidth)));
+  }
   out.Set("lineCount", Napi::Number::New(env, metrics.lineCount));
 
   std::vector<DWRITE_LINE_METRICS> lines(metrics.lineCount);
@@ -1046,6 +1061,28 @@ Napi::Value LayoutCaret(const Napi::CallbackInfo& info) {
   out.Set("x", Napi::Number::New(env, x));
   out.Set("y", Napi::Number::New(env, y));
   out.Set("height", Napi::Number::New(env, metrics.height));
+  return out;
+}
+
+// layoutMinWidth(handle) -> the min-content width, in whole pixels rounded up:
+// what `layoutMetrics` answers as `minWidth` unless asked not to.
+Napi::Value LayoutMinWidth(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  TextLayout* entry = LayoutFor(info[0].As<Napi::Number>().Int32Value());
+  if (!entry) return env.Null();
+  float minWidth = 0;
+  entry->layout->DetermineMinWidth(&minWidth);
+  return Napi::Number::New(env, std::ceil(minWidth));
+}
+
+// textFeatures() -> what this bridge's layouts take that an older one's do
+// not, for a caller to ask rather than to know a version: `justify`, and
+// `minWidth: false` on `layoutMetrics` with `layoutMinWidth` beside it.
+Napi::Value TextFeatures(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Object out = Napi::Object::New(env);
+  out.Set("justify", Napi::Boolean::New(env, true));
+  out.Set("lazyMinWidth", Napi::Boolean::New(env, true));
   return out;
 }
 
@@ -1588,6 +1625,8 @@ void InitTextExports(Napi::Env env, Napi::Object exports) {
   set("layoutCreate", LayoutCreate);
   set("layoutMetrics", LayoutMetrics);
   set("layoutRelease", LayoutRelease);
+  set("layoutMinWidth", LayoutMinWidth);
+  set("textFeatures", TextFeatures);
   set("layoutIndexAt", LayoutIndexAt);
   set("layoutCaret", LayoutCaret);
   // These two names are BackendContext2D's, not ours: it calls them on the
