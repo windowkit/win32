@@ -93,6 +93,45 @@ assert.ok(
   'a span with features laid out nothing',
 );
 
+// --- what a layout takes ----------------------------------------------------
+
+const features = win32.textFeatures();
+assert.strictEqual(features.justify, true);
+assert.strictEqual(features.lazyMinWidth, true);
+
+// Justified: every line but the paragraph's last fills the width, the last
+// is left as it is.
+const prose =
+  'The quick brown fox jumps over the lazy dog, again and again, until the ' +
+  'paragraph runs over several lines of a narrow column.';
+const linesOf = (justify) =>
+  win32.layoutMetrics(
+    win32.layoutCreate(prose, { family: 'Segoe UI', size: 14, maxWidth: 160, justify }),
+  ).lines;
+const ragged = linesOf(false);
+const justified = linesOf(true);
+assert.ok(justified.length > 2, 'the column did not wrap');
+assert.strictEqual(justified.length, ragged.length, 'justifying moved a break');
+// (a line's width here takes in the space it wrapped at)
+for (const line of justified.slice(0, -1)) {
+  assert.ok(line.width >= 159, `a justified line ${line.width} wide, short of 160`);
+}
+assert.ok(
+  ragged.slice(0, -1).some((line) => line.width < 159),
+  'no ragged line fell short, so the test shows nothing',
+);
+assert.ok(
+  Math.abs(justified.at(-1).width - ragged.at(-1).width) <= 0.5,
+  'the last line was justified too',
+);
+
+// The min-content width on request: left out of the metrics when asked,
+// and the same number from `layoutMinWidth`.
+const lazy = win32.layoutCreate(prose, { family: 'Segoe UI', size: 14, maxWidth: 160 });
+assert.strictEqual(win32.layoutMetrics(lazy, { minWidth: false }).minWidth, undefined);
+assert.strictEqual(win32.layoutMinWidth(lazy), win32.layoutMetrics(lazy).minWidth);
+assert.ok(win32.layoutMinWidth(lazy) > 0);
+
 // --- drawing through the verb table ----------------------------------------
 
 const surface = win32.createSurface(200, 100, 1);
