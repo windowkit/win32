@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.8](https://github.com/windowkit/win32/compare/v0.0.7...v0.0.8) (2026-10-04)
+
+
+### Features
+
+* setCursor, GDI face names (fontFamilyOf), font width, letter spacing, OpenType features and x-height for react-x11's Windows text engine ([#14](https://github.com/windowkit/win32/issues/14)) ([59c7862](https://github.com/windowkit/win32/commit/59c786242528b9b1fc0f1ea0b7b6524290f8f12d))
+
 ## [0.0.7](https://github.com/windowkit/win32/compare/v0.0.6...v0.0.7) (2026-10-03)
 
 
