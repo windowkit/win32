@@ -87,6 +87,10 @@ struct Window {
   bool fullscreen = false;
   LONG_PTR framedStyle = 0;
   RECT framedRect = {};
+  // The cursor shown over the client area: what `setCursor` last named, and
+  // null for `none`. Read and written on the UI thread alone — WM_SETCURSOR
+  // reads it, and `setCursor` writes it from a posted command.
+  HCURSOR cursor = ::LoadCursorW(nullptr, IDC_ARROW);
 };
 
 std::mutex g_mutex;
@@ -313,6 +317,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
     // leaves activation where it was, which is what a menu does.
     case WM_MOUSEACTIVATE:
       if (window->popup) return MA_NOACTIVATE;
+      break;
+
+    // The class cursor is the arrow, and Windows puts it back on every move
+    // over the client area unless the window answers this. Over the frame —
+    // a resize edge, the caption — the system's own answer stands.
+    case WM_SETCURSOR:
+      if (LOWORD(lparam) == HTCLIENT) {
+        ::SetCursor(window->cursor);
+        return TRUE;
+      }
       break;
 
     case WM_MOUSEMOVE: {
@@ -1239,6 +1253,54 @@ Napi::Value SetTitle(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// A CSS cursor name as one of the system's cursors — the names react-x11
+// sets, which are ntk's (X11's cursor font) and CSS's. A name with no shape
+// of its own here is the arrow, as an unknown `cursor` is in a browser. The
+// hands are one: Windows has the link hand and no open or closed one.
+LPCWSTR CursorShape(const std::string& name) {
+  static const std::map<std::string, LPCWSTR> shapes = {
+      {"pointer", IDC_HAND},         {"hand", IDC_HAND},
+      {"grab", IDC_HAND},            {"grabbing", IDC_HAND},
+      {"text", IDC_IBEAM},           {"vertical-text", IDC_IBEAM},
+      {"wait", IDC_WAIT},            {"progress", IDC_APPSTARTING},
+      {"move", IDC_SIZEALL},         {"all-scroll", IDC_SIZEALL},
+      {"crosshair", IDC_CROSS},      {"cell", IDC_CROSS},
+      {"help", IDC_HELP},            {"not-allowed", IDC_NO},
+      {"no-drop", IDC_NO},           {"ew-resize", IDC_SIZEWE},
+      {"col-resize", IDC_SIZEWE},    {"e-resize", IDC_SIZEWE},
+      {"w-resize", IDC_SIZEWE},      {"ns-resize", IDC_SIZENS},
+      {"row-resize", IDC_SIZENS},    {"n-resize", IDC_SIZENS},
+      {"s-resize", IDC_SIZENS},      {"nwse-resize", IDC_SIZENWSE},
+      {"nw-resize", IDC_SIZENWSE},   {"se-resize", IDC_SIZENWSE},
+      {"nesw-resize", IDC_SIZENESW}, {"ne-resize", IDC_SIZENESW},
+      {"sw-resize", IDC_SIZENESW},
+  };
+  auto it = shapes.find(name);
+  return it == shapes.end() ? IDC_ARROW : it->second;
+}
+
+// setCursor(windowId, name): the cursor over the window's client area, by its
+// CSS name, `none` for none. Shown at once where the pointer is already over
+// the client area — the move that changed what is under it has been answered
+// by then — and from then on on every WM_SETCURSOR.
+Napi::Value SetCursorShape(const Napi::CallbackInfo& info) {
+  const int id = info[0].As<Napi::Number>().Int32Value();
+  if (!LookupWindow(id)) return info.Env().Undefined();
+  const std::string name = info.Length() > 1 && info[1].IsString()
+                               ? info[1].As<Napi::String>().Utf8Value()
+                               : std::string("default");
+  PostCommand([id, name]() {
+    Window* window = LookupWindow(id);
+    if (!window || !window->hwnd) return;
+    window->cursor = name == "none" ? nullptr : ::LoadCursorW(nullptr, CursorShape(name));
+    POINT at;
+    if (!::GetCursorPos(&at) || ::WindowFromPoint(at) != window->hwnd) return;
+    const LRESULT hit = ::SendMessageW(window->hwnd, WM_NCHITTEST, 0, MAKELPARAM(at.x, at.y));
+    if (hit == HTCLIENT) ::SetCursor(window->cursor);
+  });
+  return info.Env().Undefined();
+}
+
 Napi::Value ResizeWindow(const Napi::CallbackInfo& info) {
   Window* window = LookupWindow(info[0].As<Napi::Number>().Int32Value());
   if (!window) return info.Env().Undefined();
@@ -1427,6 +1489,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("commit", Napi::Function::New(env, Commit));
   exports.Set("resize", Napi::Function::New(env, Resize));
   exports.Set("setTitle", Napi::Function::New(env, SetTitle));
+  exports.Set("setCursor", Napi::Function::New(env, SetCursorShape));
   exports.Set("resizeWindow", Napi::Function::New(env, ResizeWindow));
   exports.Set("moveWindow", Napi::Function::New(env, MoveWindow));
   exports.Set("windowState", Napi::Function::New(env, WindowState));
